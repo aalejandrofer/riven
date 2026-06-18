@@ -875,6 +875,14 @@ class Show(MediaItem):
                 season.state in (States.Completed, States.PartiallyCompleted)
                 for season in self.seasons
             ):
+                # Show may have paused seasons + completed current season; if
+                # TVDB still lists the show as airing, stay Ongoing so the
+                # scheduler keeps reindexing for new episodes (see issue #1398).
+                if self.tvdb_status and self.tvdb_status.lower() in [
+                    "continuing",
+                    "upcoming",
+                ]:
+                    return States.Ongoing
                 return States.PartiallyCompleted
 
             if any(season.state == States.Symlinked for season in self.seasons):
