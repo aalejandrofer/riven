@@ -12,6 +12,7 @@ from enum import IntEnum
 from program.services.downloaders.models import (
     VALID_VIDEO_EXTENSIONS,
     DebridFile,
+    InfringingTorrentException,
     InvalidDebridFileException,
     TorrentContainer,
     TorrentFile,
@@ -168,7 +169,53 @@ class RealDebridDownloader(DownloaderBase):
         self.key = "realdebrid"
         self.settings = settings_manager.settings.downloaders.real_debrid
         self.api: RealDebridAPI | None = None
+        # Patch 0011: in-memory set of infohashes RD has flagged 451.
+        # Populated from Stream.flagged_451_services (filtered for our
+        # service key) at init; written through on every 451 we observe.
+        self._451_hashes: set[str] = set()
         self.initialized = self.validate()
+        if self.initialized:
+            self._load_451_hashes()
+
+    def _load_451_hashes(self) -> None:
+        """Populate _451_hashes from Stream.flagged_451_services where our key is present."""
+        try:
+            from program.db.db import db_session
+            from program.media.stream import Stream
+            from sqlalchemy import select
+            with db_session() as s:
+                rows = s.execute(
+                    select(Stream.infohash, Stream.flagged_451_services)
+                ).all()
+                for infohash, services in rows:
+                    if services and self.key in services:
+                        self._451_hashes.add(infohash)
+            if self._451_hashes:
+                logger.info(
+                    f"Real-Debrid: pre-loaded {len(self._451_hashes)} known-451 infohashes from DB"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to load 451 hashes from DB: {e}")
+
+    def _mark_infohash_451_in_db(self, infohash: str) -> None:
+        """Append our service key to flagged_451_services for every Stream row with this hash."""
+        try:
+            from program.db.db import db_session
+            from program.media.stream import Stream
+            from sqlalchemy import select
+            with db_session() as s:
+                streams = s.execute(select(Stream).where(Stream.infohash == infohash)).scalars().all()
+                changed = False
+                for st in streams:
+                    services = list(st.flagged_451_services or [])
+                    if self.key not in services:
+                        services.append(self.key)
+                        st.flagged_451_services = services
+                        changed = True
+                if changed:
+                    s.commit()
+        except Exception as e:
+            logger.debug(f"Failed to persist 451 for {infohash}: {e}")
 
     def validate(self) -> bool:
         """
@@ -236,6 +283,10 @@ class RealDebridDownloader(DownloaderBase):
         container: TorrentContainer | None = None
         torrent_id: str | None = None
 
+        # Skip hashes already flagged as infringing in this process.
+        if infohash in self._451_hashes:
+            raise InfringingTorrentException(infohash)
+
         try:
             torrent_id = self.add_torrent(infohash)
             container, reason, info = self._process_torrent(
@@ -279,6 +330,7 @@ class RealDebridDownloader(DownloaderBase):
             raise
         except RealDebridError as e:
             # add_torrent/select_files/delete_torrent surface HTTP error context via _handle_error
+            error_msg = str(e)
             logger.warning(f"Availability check failed [{infohash}]: {e}")
 
             if torrent_id:
@@ -286,6 +338,15 @@ class RealDebridDownloader(DownloaderBase):
                     self.delete_torrent(torrent_id)
                 except Exception:
                     pass
+
+            # 451 = Infringing torrent - raise special exception for immediate blacklisting
+            # This is a permanent failure, the torrent will never work on this debrid service.
+            # Cache the hash (in-memory + DB) so subsequent items with the same
+            # hash skip RD entirely, even across container restarts.
+            if "[451]" in error_msg:
+                self._451_hashes.add(infohash)
+                self._mark_infohash_451_in_db(infohash)
+                raise InfringingTorrentException(infohash)
 
             return None
         except InvalidDebridFileException as e:

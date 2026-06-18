@@ -57,6 +57,15 @@ class Stream(Base):
     lev_ratio: Mapped[float]
     resolution: Mapped[str | None]
     is_cached: bool = False
+    # Patch 0011: track which debrid services have returned 451 / infringing
+    # for this hash. Stored as a JSON list of service keys (e.g. ["realdebrid"]).
+    # Per-service, not global — a hash RD 451'd may still work on AllDebrid.
+    flagged_451_services: Mapped[list[str]] = mapped_column(
+        sqlalchemy.JSON,
+        default=list,
+        server_default=sqlalchemy.text("'[]'"),
+        nullable=False,
+    )
     parents: Mapped[list["MediaItem"]] = relationship(
         secondary="StreamRelation", back_populates="streams", lazy="selectin"
     )

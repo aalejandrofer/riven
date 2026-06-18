@@ -17,6 +17,7 @@ from program.media.models import ActiveStream, MediaMetadata
 from program.services.downloaders.models import (
     DebridFile,
     DownloadedTorrent,
+    InfringingTorrentException,
     NoMatchingFilesException,
     NotCachedException,
     TorrentContainer,
@@ -112,6 +113,12 @@ class Downloader(Runner[None, DownloaderBase]):
         # Track if we hit circuit breaker on any service
         hit_circuit_breaker = False
 
+        # Stale-pool detection (patch 0008): count how many streams failed
+        # purely because they are 451 / infringing.  If that's *all* of
+        # them, push the item's next retry out by 48h so we stop burning
+        # cycles on a dead release pool.
+        infringing_count = 0
+
         try:
             # Sort streams by resolution and rank (highest first) using simple, fast sorting
             sorted_streams = sort_streams_by_quality(item.streams)
@@ -183,6 +190,21 @@ class Downloader(Runner[None, DownloaderBase]):
                             stream_failed_on_all_services = False
                         continue
 
+                    except InfringingTorrentException as e:
+                        # Patch 0011: do NOT blacklist the stream for this item
+                        # on a single-service 451. Let the existing
+                        # all-services-failed mechanism handle per-item
+                        # blacklisting after every initialized service has
+                        # had a chance. With multi-debrid one service can
+                        # 451 while another still serves the same hash.
+                        # The per-service global 451-list (Stream.flagged_451_services)
+                        # is updated inside the service's get_instant_availability.
+                        logger.warning(
+                            f"Stream {stream.infohash} flagged 451 by {service.key}; trying next service"
+                        )
+                        infringing_count += 1
+                        continue
+
                     except Exception as e:
                         logger.debug(
                             f"Stream {stream.infohash} failed on {service.key}: {e}"
@@ -251,6 +273,23 @@ class Downloader(Runner[None, DownloaderBase]):
             )
 
         if not download_success:
+            # Stale-pool detection: if every stream we tried hit 451 /
+            # infringing, the release pool is dead — re-scraping in a few
+            # minutes will just rediscover the same dead hashes.  Push
+            # next attempt 48h out so the item doesn't dominate cycles.
+            if (
+                infringing_count > 0
+                and infringing_count >= len(sorted_streams)
+                and len(sorted_streams) > 0
+            ):
+                from datetime import datetime as _dt, timedelta as _td
+                next_attempt = _dt.now() + _td(hours=48)
+                logger.warning(
+                    f"All {infringing_count} stream attempts for {item.log_string} ({item.id}) returned 451 — stale pool; rescheduling for {next_attempt.strftime('%m/%d/%y %H:%M:%S')}"
+                )
+                yield RunnerResult(media_items=[item], run_at=next_attempt)
+                return
+
             # Check if we hit circuit breaker in single-provider mode
             if hit_circuit_breaker and len(self.initialized_services) == 1:
                 # Reschedule for after cooldown instead of failing
