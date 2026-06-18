@@ -91,6 +91,12 @@ def parse_results(
 
     # Use effective RTN settings (handles explicit overrides/context implicitly)
     active_settings = settings_manager.get_effective_rtn_model()
+
+    # Anime exception: allow 720p for anime when enabled. Anime releases are
+    # frequently only available at 720p, which the global ranking config may
+    # exclude for movies / live-action TV.
+    if getattr(item, "is_anime", False) and settings_manager.settings.scraping.anime_allow_720p:
+        active_settings.resolutions.r720p = True
     
     # Check if we are diverging from the global singleton `rtn` instance
     is_default_settings = (active_settings.model_dump() == ranking_settings.model_dump())

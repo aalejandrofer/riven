@@ -788,6 +788,10 @@ class ScraperModel(Observable):
     dubbed_anime_only: bool = Field(
         default=False, description="Only scrape dubbed anime content"
     )
+    anime_allow_720p: bool = Field(
+        default=False,
+        description="Allow 720p releases for anime even when 720p is globally excluded in ranking",
+    )
     torrentio: TorrentioConfig = Field(
         default_factory=lambda: TorrentioConfig(), description="Torrentio configuration"
     )
