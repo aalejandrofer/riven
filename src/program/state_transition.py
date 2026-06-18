@@ -109,12 +109,53 @@ def process_event(
             # Keep the Season as a unit — the scraper finds both season packs
             # and individual episodes.  Decomposing to per-episode scraping
             # here would prevent season-pack matching.
-            if services.scraping.should_submit(existing_item):
+            #
+            # Patch 0018: After SEASON_PACK_FALLBACK_THRESHOLD failed Season
+            # scrapes (no pack found), decompose to per-Episode scraping so
+            # individual ep releases (rejected by Season filter's
+            # len(episodes) <= 2 rule) can be picked up. Otherwise Ongoing
+            # shows with only single-ep releases on Comet stall forever.
+            SEASON_PACK_FALLBACK_THRESHOLD = 3
+            if (
+                existing_item.failed_attempts
+                >= SEASON_PACK_FALLBACK_THRESHOLD
+            ):
+                items_to_submit = [
+                    e
+                    for e in existing_item.episodes
+                    if e.last_state
+                    in [States.Indexed, States.Unknown]
+                    and (
+                        overrides is not None
+                        or services.scraping.should_submit(e)
+                    )
+                ]
+            elif services.scraping.should_submit(existing_item):
                 items_to_submit = [existing_item]
 
     elif existing_item and existing_item.last_state == States.Scraped:
-        next_service = services.downloader
-        items_to_submit = [existing_item]
+        if isinstance(existing_item, Show):
+            # Show-level scrape found streams, but the Downloader cannot act
+            # on a show-level item (silent stuck — see issue #1400). Cascade
+            # to season-level scraping for any seasons that still need it.
+            items_to_submit = [
+                s
+                for s in existing_item.seasons
+                if s.last_state in [States.Indexed, States.Unknown]
+                and services.scraping.should_submit(s)
+            ]
+            if items_to_submit:
+                next_service = services.scraping
+            else:
+                # All seasons already past Indexed/Unknown — fall through to
+                # the downloader so the show progresses (e.g. if seasons are
+                # already Scraped, each is handled individually on its own
+                # event).
+                next_service = services.downloader
+                items_to_submit = [existing_item]
+        else:
+            next_service = services.downloader
+            items_to_submit = [existing_item]
 
     elif existing_item and existing_item.last_state == States.Downloaded:
         next_service = services.filesystem
