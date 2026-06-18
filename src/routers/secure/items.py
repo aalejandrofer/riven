@@ -807,11 +807,14 @@ async def remove_item(
                 logger.warning(f"Item {item_id} not found, skipping")
                 continue
 
-            # Only allow movies and shows to be removed
-            if not isinstance(item, (Movie, Show)):
+            # Patch 0019: allow Movie/Show/Season/Episode. Season/Episode
+            # removal skips Overseerr (request lives on the parent show) and
+            # uses a representative episode's filesystem entry for refresh
+            # path computation.
+            if not isinstance(item, (Movie, Show, Season, Episode)):
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Only movies and shows can be removed. Item {item_id} is a {item.type}",
+                    detail=f"Item {item_id} is a {item.type} and cannot be removed",
                 )
 
             logger.debug(f"Removing item with ID {item.id}")
@@ -822,8 +825,17 @@ async def remove_item(
             # 2. Gather all refresh paths before deletion (entry may appear at multiple VFS paths)
             refresh_paths = list[str]()
 
-            if updater and item.filesystem_entry:
-                if media_entry := item.media_entry:
+            # For Season, refresh from any child episode that has a file.
+            # For Movie/Show/Episode, use the item's own filesystem_entry.
+            refresh_source = item
+            if isinstance(item, Season):
+                refresh_source = next(
+                    (e for e in item.episodes if e.filesystem_entry),
+                    item,
+                )
+
+            if updater and refresh_source.filesystem_entry:
+                if media_entry := refresh_source.media_entry:
                     for vfs_path in media_entry.get_all_vfs_paths():
                         # Check if VFS path is already absolute (filesystem path)
                         # VFS paths are normally VFS-relative (e.g., /movies/...) but could be
@@ -846,15 +858,15 @@ async def remove_item(
 
                         if isinstance(item, Movie):
                             refresh_path = os.path.dirname(os.path.dirname(abs_path))
-                        else:  # show
+                        else:  # Show / Season / Episode all live under show dir
                             refresh_path = os.path.dirname(
                                 os.path.dirname(os.path.dirname(abs_path))
                             )
                         if refresh_path not in refresh_paths:
                             refresh_paths.append(refresh_path)
 
-            # 3. Delete from Overseerr
-            if item.overseerr_id and overseerr:
+            # 3. Delete from Overseerr (only Movie/Show carry the request)
+            if isinstance(item, (Movie, Show)) and item.overseerr_id and overseerr:
                 try:
                     overseerr.api.delete_request(item.overseerr_id)
 
