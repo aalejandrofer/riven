@@ -89,7 +89,7 @@ class SettingsManager:
 
         return checked_settings
 
-    def load(self, settings_dict: dict[str, Any] | None = None):
+    def load(self, settings_dict: dict[str, Any] | None = None, notify: bool = True):
         """Load settings from file, validating against the AppModel schema."""
 
         try:
@@ -120,7 +120,8 @@ class SettingsManager:
                 f"Error loading settings: {self.settings_file} does not exist"
             )
             raise
-        self.notify_observers()
+        if notify:
+            self.notify_observers()
 
     def save(self):
         """Save settings to file, using Pydantic model for JSON serialization."""
