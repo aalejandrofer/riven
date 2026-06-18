@@ -847,6 +847,13 @@ class Show(MediaItem):
         super().__init__(item)
 
     def _determine_state(self):
+        # Sticky pause: a show user-paused via the API set last_state=Paused.
+        # Without this guard, _determine_state recomputes from children on
+        # the next access (e.g. after a restart) and the show "un-pauses"
+        # because its children kept their original states. See gap #1.
+        if self.last_state == States.Paused:
+            return States.Paused
+
         if len(self.seasons) > 0:
             if all(season.state == States.Paused for season in self.seasons):
                 return States.Paused
@@ -1027,6 +1034,10 @@ class Season(MediaItem):
         super().__init__(item)
 
     def _determine_state(self):
+        # Sticky pause: same reasoning as Show — see gap #1.
+        if self.last_state == States.Paused:
+            return States.Paused
+
         if len(self.episodes) > 0:
             if all(episode.state == States.Paused for episode in self.episodes):
                 return States.Paused
