@@ -91,7 +91,19 @@ def parse_results(
 
     # Use effective RTN settings (handles explicit overrides/context implicitly)
     active_settings = settings_manager.get_effective_rtn_model()
-    
+
+    # Anime exception: allow 720p and untagged releases for anime even when
+    # they're globally excluded. Anime is frequently only available at 720p,
+    # and fansub naming often carries no resolution token at all (747 such
+    # streams across 410 anime items when this was measured). The global
+    # ranking config excludes both for everything else, because untagged
+    # releases otherwise bypass the resolution ban AND, with
+    # remove_unknown_languages=false, the language filter too - which is how
+    # foreign-dub HDTV rips kept winning auto-selection.
+    if getattr(item, "is_anime", False):
+        active_settings.resolutions.r720p = True
+        active_settings.resolutions.unknown = True
+
     # Check if we are diverging from the global singleton `rtn` instance
     is_default_settings = (active_settings.model_dump() == ranking_settings.model_dump())
     
