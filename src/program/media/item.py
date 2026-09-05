@@ -491,7 +491,7 @@ class MediaItem(MappedAsDataclass, Base, kw_only=True):
             "tvdb_id": self.tvdb_id,
             "tmdb_id": self.tmdb_id,
             "parent_ids": parent_ids,
-            "state": self.last_state.name if self.last_state else self.state.name,
+            "state": "Excluded" if self.is_excluded else (self.last_state.name if self.last_state else self.state.name),
             "aired_at": str(self.aired_at),
             "genres": self.genres,
             "is_anime": bool(self.is_anime),
