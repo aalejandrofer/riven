@@ -49,10 +49,11 @@ class Downloader(Runner[None, DownloaderBase]):
             AllDebridDownloader: AllDebridDownloader(),
         }
 
-        # Get all initialized services instead of just the first one
-        self.initialized_services = [
-            service for service in self.services.values() if service.initialized
-        ]
+        # Get all initialized services instead of just the first one,
+        # ordered by the `downloaders.priority` setting (patch 0044).
+        self.initialized_services = self._order_by_priority(
+            [service for service in self.services.values() if service.initialized]
+        )
 
         # Keep backward compatibility - primary service is the first initialized one
         self.service = (
@@ -66,6 +67,53 @@ class Downloader(Runner[None, DownloaderBase]):
         self.subtitles_enabled = (
             settings_manager.settings.post_processing.subtitle.enabled
         )
+
+    def _order_by_priority(
+        self, services: list[DownloaderBase]
+    ) -> list[DownloaderBase]:
+        """Order the initialized downloaders by `downloaders.priority`.
+
+        The setting is a list of service keys ("realdebrid", "debridlink",
+        "alldebrid"). Ordering happens here rather than in the settings model
+        because this is the only place that knows which keys exist -- the
+        model cannot import the downloader classes without a cycle.
+
+        Contract:
+        - a key that is listed but not initialized is simply absent;
+        - an initialized service that is *not* listed keeps its declaration
+          order, after every service that is listed, so a partial list can
+          never silently drop a working downloader;
+        - an unrecognised key is logged and skipped, never raised, so a typo
+          cannot stop the program from starting.
+        """
+        priority = settings_manager.settings.downloaders.priority or []
+
+        known = {service.key for service in self.services.values()}
+        remaining = {service.key: service for service in services}
+
+        ordered = list[DownloaderBase]()
+
+        for entry in priority:
+            key = str(entry).strip().lower()
+
+            if key not in known:
+                logger.warning(
+                    f"Ignoring unknown downloader '{entry}' in "
+                    f"downloaders.priority (known: {', '.join(sorted(known))})"
+                )
+                continue
+
+            service = remaining.pop(key, None)
+
+            if service is not None:
+                ordered.append(service)
+
+        # Whatever the priority list did not name keeps its original order.
+        ordered.extend(
+            service for service in services if service.key in remaining
+        )
+
+        return ordered
 
     def validate(self):
         if not self.initialized_services:
