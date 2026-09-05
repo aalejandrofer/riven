@@ -77,24 +77,60 @@ class ProgramScheduler:
     # ---------------------------------------------------------------- runners
     # Introspection for the frontend Runners tab (patch 0034).
 
+    @staticmethod
+    def _event_run_key(event):
+        """The scheduled fire time this event belongs to.
+
+        APScheduler names it differently per event class: JobSubmissionEvent
+        carries `scheduled_run_times` (a LIST, since a coalesced job can cover
+        several missed fires) while JobExecutionEvent carries the singular
+        `scheduled_run_time`. Reading only the singular form yields None for
+        every submit event, so the two halves of a run never match up.
+        """
+
+        run_time = getattr(event, "scheduled_run_time", None)
+        if run_time is not None:
+            return run_time
+
+        times = getattr(event, "scheduled_run_times", None)
+        return times[0] if times else None
+
     def _record_job_event(self, event) -> None:
-        """Track start/finish/outcome per job id for the Runners view."""
+        """Track start/finish/outcome per job id for the Runners view.
+
+        Events are NOT delivered in causal order: a job short enough to finish
+        before the scheduler thread dispatches its EVENT_JOB_SUBMITTED will
+        deliver the terminal event first. Handling them naively left `running`
+        stuck True until the next fire - visible as "Mdblist content poll" that
+        looked permanently running on a 24h interval (patch 0035). So key each
+        run by its scheduled_run_time and ignore a SUBMITTED for a run that has
+        already terminated.
+        """
 
         entry = self.run_history.setdefault(event.job_id, {})
+        run_key = self._event_run_key(event)
 
         if event.code == EVENT_JOB_SUBMITTED:
+            if run_key is not None and entry.get("finished_run") == run_key:
+                return  # terminal event for this run already arrived
+
             entry["started_at"] = datetime.now()
+            entry["started_run"] = run_key
             entry["running"] = True
             return
 
         entry["running"] = False
         entry["finished_at"] = datetime.now()
+        entry["finished_run"] = run_key
 
+        # Only trust the duration when both halves describe the same run.
         started = entry.get("started_at")
-        if started:
+        if started and entry.get("started_run") == run_key:
             entry["duration_ms"] = int(
                 (entry["finished_at"] - started).total_seconds() * 1000
             )
+        else:
+            entry["duration_ms"] = None
 
         if event.code == EVENT_JOB_ERROR:
             entry["ok"] = False
@@ -328,15 +364,17 @@ class ProgramScheduler:
             item = self._load_item_for_task(session, task)
 
             if not item:
-                self._mark_task_status(
-                    session,
-                    task,
-                    ScheduledStatus.Failed,
-                    now,
-                )
+                # ScheduledTask.item_id has NO foreign key to MediaItem, so
+                # removing an item leaves its tasks behind. Marking them Failed
+                # kept them forever and they were pure noise: on 2026-08-24 all
+                # 226 "failed" tasks were orphans of deleted items, nothing had
+                # actually gone wrong. Delete instead - there is no item left to
+                # retry, and the row can never become valid again (patch 0035).
+                session.delete(task)
+                session.commit()
 
                 logger.debug(
-                    f"ScheduledTask {task.id} item {task.item_id} no longer exists"
+                    f"ScheduledTask {task.id} item {task.item_id} no longer exists; task removed"
                 )
 
                 return
