@@ -372,11 +372,15 @@ def run_thread_with_db_item(
                         run_at = runner_result.run_at
 
                         if item.is_excluded:
-                            logger.trace(
-                                f"Item {item.log_string} is excluded, deleting from DB."
-                            )
-
-                            session.delete(item)
+                            # Patch 0012: mark item with the Excluded state instead
+                            # of session.delete - keeps the row in DB so the UI
+                            # can show it (and the user can un-exclude later).
+                            # Pipeline filters Excluded via is_excluded check.
+                            if item.last_state != States.Excluded:
+                                logger.trace(
+                                    f"Item {item.log_string} is excluded, marking last_state=Excluded."
+                                )
+                                item.store_state(States.Excluded)
 
                         if not cancellation_event.is_set():
                             # Update item state
