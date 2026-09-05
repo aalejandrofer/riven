@@ -47,10 +47,11 @@ class TMDBApi:
         return FindById200Response.from_dict(response.json())
 
     def get_movie_details_with_external_ids_and_release_dates(self, movie_id: str):
-        """Get movie details with external IDs and release dates appended"""
+        """Get movie details with external IDs, release dates and alternative titles appended"""
 
         response = self.session.get(
-            f"movie/{movie_id}?append_to_response=external_ids,release_dates"
+            f"movie/{movie_id}"
+            "?append_to_response=external_ids,release_dates,alternative_titles"
         )
 
         from schemas.tmdb import (
@@ -62,6 +63,10 @@ class TMDBApi:
         class MovieDetailsWithExtras(MovieDetails200Response):
             external_ids: MovieExternalIds200Response
             release_dates: MovieReleaseDates200Response
+            # Kept as a raw mapping: the generated schemas carry no model for
+            # the alternative-titles payload, and only `titles[].iso_3166_1`
+            # plus `titles[].title` are ever read.
+            alternative_titles: dict = {}
 
         data = response.json()
 
@@ -80,5 +85,6 @@ class TMDBApi:
                 **movie_details.model_dump(),
                 "external_ids": external_ids,
                 "release_dates": release_dates,
+                "alternative_titles": data.get("alternative_titles") or {},
             }
         )

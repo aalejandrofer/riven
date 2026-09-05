@@ -21,6 +21,67 @@ class TMDBIndexer(BaseIndexer):
         self.api = di[TMDBApi]
         self.trakt_api = di[TraktAPI]
 
+    @staticmethod
+    def _merge_tmdb_aliases(
+        aliases: dict[str, list[str]] | None,
+        movie_details,
+    ) -> dict[str, list[str]]:
+        """Fold TMDB's own titles into the alias map.
+
+        Trakt is the ONLY alias source for movies and it returns nothing at all
+        for a large share of titles, so a film released under its
+        original-language name is only ever matched against the English TMDB
+        title. Shows do not have this problem: TVDBIndexer already falls back to
+        TVDB aliases when Trakt is empty. Movies had no fallback.
+
+        TMDB knows both the original title and a per-country alternative-title
+        list, and `alternative_titles` rides along on the `append_to_response`
+        of the request the indexer already makes, so this costs no extra call.
+
+        Additive: Trakt's aliases are preserved. It has to be additive rather
+        than a fallback, because a title can have Trakt aliases for the wrong
+        countries and still be missing the one the release is named after.
+        """
+
+        merged = {
+            country: list(titles)
+            for country, titles in (aliases or {}).items()
+            if country and titles
+        }
+
+        def add(key: str | None, title: str | None) -> None:
+            if not isinstance(key, str) or not isinstance(title, str):
+                return
+
+            key = key.strip().lower()
+            title = title.strip()
+
+            if not key or not title:
+                return
+
+            bucket = merged.setdefault(key, [])
+
+            if title not in bucket:
+                bucket.append(title)
+
+        # The original title is the single most valuable alias, because it is
+        # what non-English releases are actually named. Keyed by the original
+        # language so an excluded language still drops it (parse_results filters
+        # aliases against ranking.languages.exclude).
+        add(
+            getattr(movie_details, "original_language", None),
+            getattr(movie_details, "original_title", None),
+        )
+
+        alternative_titles = getattr(movie_details, "alternative_titles", None)
+
+        if isinstance(alternative_titles, dict):
+            for entry in alternative_titles.get("titles") or []:
+                if isinstance(entry, dict):
+                    add(entry.get("iso_3166_1"), entry.get("title"))
+
+        return merged
+
     def run(
         self,
         item: MediaItem,
@@ -158,6 +219,7 @@ class TMDBIndexer(BaseIndexer):
 
             # Aliases
             aliases = self.trakt_api.get_aliases(movie_details.imdb_id, "movies") or {}
+            aliases = self._merge_tmdb_aliases(aliases, movie_details)
 
             full_poster_url = (
                 f"https://image.tmdb.org/t/p/w500{movie_details.poster_path}"
@@ -289,6 +351,7 @@ class TMDBIndexer(BaseIndexer):
 
             # Aliases
             aliases = self.trakt_api.get_aliases(movie_details.imdb_id, "movies") or {}
+            aliases = self._merge_tmdb_aliases(aliases, movie_details)
 
             full_poster_url = (
                 f"https://image.tmdb.org/t/p/w500{movie_details.poster_path}"
