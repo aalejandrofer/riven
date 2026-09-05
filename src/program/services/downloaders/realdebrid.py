@@ -169,6 +169,11 @@ class RealDebridDownloader(DownloaderBase):
         self.key = "realdebrid"
         self.settings = settings_manager.settings.downloaders.real_debrid
         self.api: RealDebridAPI | None = None
+        # In-memory set of infohashes RD has flagged as 451 / infringing.
+        # Subsequent items pointing at the same hash skip the RD call to
+        # avoid burning rate-limit budget on hashes RD will never serve.
+        # Lost on restart (acceptable; gets repopulated quickly).
+        self._infringing_hashes: set[str] = set()
         self.initialized = self.validate()
 
     def validate(self) -> bool:
@@ -237,6 +242,10 @@ class RealDebridDownloader(DownloaderBase):
         container: TorrentContainer | None = None
         torrent_id: str | None = None
 
+        # Skip hashes already flagged as infringing in this process.
+        if infohash in self._infringing_hashes:
+            raise InfringingTorrentException(infohash)
+
         try:
             torrent_id = self.add_torrent(infohash)
             container, reason, info = self._process_torrent(
@@ -290,8 +299,10 @@ class RealDebridDownloader(DownloaderBase):
                     pass
 
             # 451 = Infringing torrent - raise special exception for immediate blacklisting
-            # This is a permanent failure, the torrent will never work on this debrid service
+            # This is a permanent failure, the torrent will never work on this debrid service.
+            # Also cache the hash so the next item with the same hash skips RD entirely.
             if "[451]" in error_msg:
+                self._infringing_hashes.add(infohash)
                 raise InfringingTorrentException(infohash)
 
             return None
