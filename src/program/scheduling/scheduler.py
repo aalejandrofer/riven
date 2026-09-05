@@ -289,10 +289,56 @@ class ProgramScheduler:
         updated = next(indexer_service.run(item, log_msg=False), None)
 
         if updated:
-            session.merge(updated.media_items[0])
+            # Use no_autoflush so SQLAlchemy doesn't try to flush the transient
+            # Season/Episode objects the indexer just created before the merge
+            # has completed.
+            with session.no_autoflush:
+                merged = session.merge(updated.media_items[0])
+
+            # SQLAlchemy 2.0 does NOT auto-cascade a transient child appended to
+            # a persistent parent's collection, so the newly-aired Season/Episode
+            # objects the TVDB indexer created via show.add_season() /
+            # season.add_episode() are silently dropped on flush ("Object of type
+            # <Season> not in session, add operation along 'Show.seasons' will
+            # not proceed"). Without this the scheduled reindex logs "Reindexed
+            # X from scheduler" every day yet never actually stores a newly-aired
+            # season — the automatic counterpart of the bug patches 0031/0032
+            # fixed on the /scrape/auto and /items/reindex routes, and the reason
+            # a continuing show only ever got its new season when a user manually
+            # requested it (patch 0033).
+            added = 0
+
+            if isinstance(merged, Show):
+                for season in merged.seasons:
+                    if season not in session:
+                        added += 1
+
+                    session.add(season)
+
+                    for episode in season.episodes:
+                        if episode not in session:
+                            added += 1
+
+                        session.add(episode)
+
             session.commit()
 
             logger.info(f"Reindexed {item.log_string} from scheduler")
+
+            # A season discovered after its episodes already aired has no
+            # upcoming-release task to enqueue it (_schedule_upcoming_episodes
+            # only schedules future air dates), so those episodes would sit
+            # Indexed indefinitely. Nudge the show into the pipeline, but only
+            # when the reindex actually persisted something new.
+            if added:
+                logger.info(
+                    f"Reindex persisted {added} new season/episode rows for "
+                    f"{merged.log_string}; enqueueing"
+                )
+
+                self.program.em.add_event(
+                    Event(emitted_by="Scheduler", item_id=merged.id)
+                )
 
     def _enqueue_item_if_needed(self, session: Session, item: MediaItem) -> None:
         """Refresh state and enqueue item to the event manager if not completed."""
