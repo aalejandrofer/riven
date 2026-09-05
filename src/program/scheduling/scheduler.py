@@ -7,6 +7,7 @@ for content services and item-specific schedules.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, TypedDict
@@ -29,6 +30,7 @@ from program.media.state import States
 from program.scheduling.models import ScheduledStatus, ScheduledTask
 from program.settings import settings_manager
 from program.types import Event
+from program.utils import data_dir_path
 from program.utils.logging import log_cleaner, logger
 from program.apis.tvdb_api import SeriesRelease
 from schemas.tvdb.models.series_airs_days import SeriesAirsDays
@@ -56,6 +58,16 @@ class ProgramScheduler:
         # way to answer "did this last run succeed?". Track it ourselves: one
         # entry per job id, overwritten each run (patch 0034).
         self.run_history: dict[str, dict] = {}
+        # ...and APScheduler has no persistent jobstore here, so every restart
+        # re-registered each job with next_run_time=now and re-fired it. Three
+        # restarts in an hour meant three full retry_library sweeps. Keep the
+        # last completed run on disk so cadence survives a restart (patch 0039).
+        self._job_state: dict[str, dict] = {}
+        # Only long-interval jobs are worth persisting. A 60s heartbeat cannot
+        # be meaningfully "re-fired" by a restart, and writing the file every
+        # minute would be 1440 pointless writes a day.
+        self._persistable_jobs: set[str] = set()
+        self._load_job_state()
 
     def start(self) -> None:
         """Create and start the background scheduler with all jobs registered."""
@@ -73,6 +85,117 @@ class ProgramScheduler:
 
         if self.scheduler and self.scheduler.running:
             self.scheduler.shutdown(wait=False)
+
+    # ------------------------------------------------------------- job state
+    # Persisted last-run times (patch 0039). APScheduler's default jobstore is
+    # in-memory, so without this every restart is a fresh schedule.
+
+    @property
+    def _job_state_file(self):
+        return data_dir_path / "job_state.json"
+
+    def _load_job_state(self) -> None:
+        """Read persisted last-run times; never let a bad file block startup."""
+
+        try:
+            raw = json.loads(self._job_state_file.read_text())
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            logger.warning(f"Ignoring unreadable job state file: {exc}")
+            return
+
+        if not isinstance(raw, dict):
+            logger.warning("Ignoring job state file: expected an object")
+            return
+
+        for job_id, record in raw.items():
+            if not isinstance(record, dict) or not record.get("finished_at"):
+                continue
+
+            self._job_state[job_id] = record
+
+            # Seed the Runners view too, so "last run" is not blank after a
+            # restart. `running` is deliberately not restored: nothing is.
+            try:
+                finished = datetime.fromtimestamp(float(record["finished_at"]))
+            except (TypeError, ValueError, OSError):
+                continue
+
+            self.run_history.setdefault(
+                job_id,
+                {
+                    "running": False,
+                    "finished_at": finished,
+                    "duration_ms": record.get("duration_ms"),
+                    "ok": record.get("ok"),
+                    "error": record.get("error"),
+                },
+            )
+
+    PERSIST_MIN_INTERVAL_S = 300
+
+    def _persist_job_state(self, job_id: str, entry: dict) -> None:
+        """Record a COMPLETED run. Never raises - this is bookkeeping."""
+
+        if job_id not in self._persistable_jobs:
+            return
+
+        self._job_state[job_id] = {
+            "finished_at": entry["finished_at"].timestamp(),
+            "duration_ms": entry.get("duration_ms"),
+            "ok": entry.get("ok"),
+            "error": entry.get("error"),
+        }
+
+        try:
+            # Write-then-rename so a crash mid-write cannot leave a truncated
+            # file that would silently reset every schedule.
+            tmp = self._job_state_file.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(self._job_state, indent=2))
+            tmp.replace(self._job_state_file)
+        except Exception as exc:
+            logger.warning(f"Could not persist job state: {exc}")
+
+    def _initial_next_run(self, job_id: str, interval_seconds: int) -> datetime:
+        """First fire for a job being registered, honouring its last real run.
+
+        Never run     -> now (first boot, or a newly added job).
+        Ran recently  -> when it is actually next due, so restarts cannot
+                         re-trigger it. This is the whole point of the patch.
+        Overdue       -> now, staggered, so a box that was down for a week
+                         still catches up instead of skipping a cycle.
+
+        Timestamps are stored as epoch seconds, not naive local ISO: this
+        container runs UTC+2 while the host is UTC, and a naive value would
+        shift by two hours if that ever changed.
+        """
+
+        now = datetime.now()
+
+        if interval_seconds >= self.PERSIST_MIN_INTERVAL_S:
+            self._persistable_jobs.add(job_id)
+        else:
+            return now
+
+        record = self._job_state.get(job_id) or {}
+        last = record.get("finished_at")
+
+        if not last:
+            return now
+
+        try:
+            due = datetime.fromtimestamp(float(last)) + timedelta(seconds=interval_seconds)
+        except (TypeError, ValueError, OSError):
+            return now
+
+        if due > now:
+            return due
+
+        # Overdue. Spread the catch-up so a long outage does not fire
+        # retry_library, the content polls and the vacuum in the same instant.
+        self._overdue_count = getattr(self, "_overdue_count", 0) + 1
+        return now + timedelta(seconds=min(self._overdue_count - 1, 6) * 10)
 
     # ---------------------------------------------------------------- runners
     # Introspection for the frontend Runners tab (patch 0034).
@@ -141,6 +264,12 @@ class ProgramScheduler:
         else:
             entry["ok"] = True
             entry["error"] = None
+
+        # Persist EXECUTED and ERROR only. A MISSED job never ran, so recording
+        # it would push the next fire out without the work having happened
+        # (patch 0039).
+        if event.code != EVENT_JOB_MISSED:
+            self._persist_job_state(event.job_id, entry)
 
     @staticmethod
     def _runner_label(job_id: str) -> str:
@@ -219,15 +348,16 @@ class ProgramScheduler:
         scheduled_functions[self._monitor_ongoing_schedules] = {"interval": 15 * 60}
 
         for func, config in scheduled_functions.items():
+            job_id = f"{func.__name__}"
             self.scheduler.add_job(
                 func,
                 "interval",
                 seconds=config["interval"],
                 args=config.get("args"),
-                id=f"{func.__name__}",
+                id=job_id,
                 max_instances=config.get("max_instances", 1),
                 replace_existing=True,
-                next_run_time=datetime.now(),
+                next_run_time=self._initial_next_run(job_id, config["interval"]),
                 misfire_grace_time=30,
             )
 
@@ -273,15 +403,16 @@ class ProgramScheduler:
             if not update_interval:
                 continue
 
+            job_id = f"{service_name}_update"
             self.scheduler.add_job(
                 self.program.em.submit_job,
                 "interval",
                 seconds=update_interval,
                 args=[service_instance, self.program],
-                id=f"{service_name}_update",
+                id=job_id,
                 max_instances=1,
                 replace_existing=True,
-                next_run_time=datetime.now(),
+                next_run_time=self._initial_next_run(job_id, update_interval),
                 coalesce=False,
             )
 
