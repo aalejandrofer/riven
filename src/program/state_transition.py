@@ -109,7 +109,28 @@ def process_event(
             # Keep the Season as a unit — the scraper finds both season packs
             # and individual episodes.  Decomposing to per-episode scraping
             # here would prevent season-pack matching.
-            if services.scraping.should_submit(existing_item):
+            #
+            # Patch 0018: After SEASON_PACK_FALLBACK_THRESHOLD failed Season
+            # scrapes (no pack found), decompose to per-Episode scraping so
+            # individual ep releases (rejected by Season filter's
+            # len(episodes) <= 2 rule) can be picked up. Otherwise Ongoing
+            # shows with only single-ep releases on Comet stall forever.
+            SEASON_PACK_FALLBACK_THRESHOLD = 3
+            if (
+                existing_item.failed_attempts
+                >= SEASON_PACK_FALLBACK_THRESHOLD
+            ):
+                items_to_submit = [
+                    e
+                    for e in existing_item.episodes
+                    if e.last_state
+                    in [States.Indexed, States.Unknown]
+                    and (
+                        overrides is not None
+                        or services.scraping.should_submit(e)
+                    )
+                ]
+            elif services.scraping.should_submit(existing_item):
                 items_to_submit = [existing_item]
 
     elif existing_item and existing_item.last_state == States.Scraped:
