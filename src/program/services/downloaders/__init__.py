@@ -191,14 +191,18 @@ class Downloader(Runner[None, DownloaderBase]):
                         continue
 
                     except InfringingTorrentException as e:
-                        # 451 Infringing Torrent - immediately blacklist, do not retry
-                        # This is a permanent failure from the debrid service
+                        # Patch 0011: do NOT blacklist the stream for this item
+                        # on a single-service 451. Let the existing
+                        # all-services-failed mechanism handle per-item
+                        # blacklisting after every initialized service has
+                        # had a chance. With multi-debrid one service can
+                        # 451 while another still serves the same hash.
+                        # The per-service global 451-list (Stream.flagged_451_services)
+                        # is updated inside the service's get_instant_availability.
                         logger.warning(
-                            f"Stream {stream.infohash} flagged as infringing by {service.key}, blacklisting immediately"
+                            f"Stream {stream.infohash} flagged 451 by {service.key}; trying next service"
                         )
-                        item.blacklist_stream(stream)
                         infringing_count += 1
-                        stream_failed_on_all_services = False  # Already handled via blacklist
                         continue
 
                     except Exception as e:
@@ -281,7 +285,7 @@ class Downloader(Runner[None, DownloaderBase]):
                 from datetime import datetime as _dt, timedelta as _td
                 next_attempt = _dt.now() + _td(hours=48)
                 logger.warning(
-                    f"All {infringing_count} streams for {item.log_string} ({item.id}) are 451/infringing — stale pool; rescheduling for {next_attempt.strftime('%m/%d/%y %H:%M:%S')}"
+                    f"All {infringing_count} stream attempts for {item.log_string} ({item.id}) returned 451 — stale pool; rescheduling for {next_attempt.strftime('%m/%d/%y %H:%M:%S')}"
                 )
                 yield RunnerResult(media_items=[item], run_at=next_attempt)
                 return
