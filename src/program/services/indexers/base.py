@@ -50,6 +50,13 @@ class BaseIndexer(Runner[IndexerModel]):
             item_a.set("seasons", item_b.seasons)
 
         if isinstance(item_b, Show) and item_a.type != "movie":
+            # Show-level request attribution. The Movie branch below calls
+            # copy_attributes; the Show branch historically copied only to
+            # matching episodes, but a freshly-requested source item has no
+            # seasons yet so that loop is a no-op -> show.requested_by /
+            # requested_at stayed NULL for every show. Copy show-level attrs
+            # here too (is_anime is re-set explicitly at the end of this block).
+            self.copy_attributes(item_a, item_b)
             for season_a in cast(Show, item_a).seasons:
                 for season_b in item_b.seasons:
                     if season_a.number == season_b.number:  # Check if seasons match
