@@ -614,14 +614,18 @@ class AllDebridDownloader(DownloaderBase):
                     all_files = list[AllDebridFile]()
 
                     for file_or_directory in files:
-                        download_link = ""
-
                         if isinstance(file_or_directory, AllDebridFile):
-                            download_link = file_or_directory.l
+                            # Top-level bare file (single-file torrent, e.g. a
+                            # standalone movie .mkv). Previously only the link was
+                            # read into an unused local and the file was never
+                            # appended -> all_files stayed empty -> _get_magnet_files
+                            # returned None -> "no files present in the torrent"
+                            # even for cached, Ready single-file magnets. Append it.
+                            all_files.append(file_or_directory)
                         else:
                             # Recursively process files/folders and add download link
                             self._add_link_to_files_recursive(
-                                file_or_directory.e, download_link, all_files
+                                file_or_directory.e, "", all_files
                             )
 
                     if all_files:
