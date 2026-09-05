@@ -58,10 +58,23 @@ class Mdblist(Runner[MdblistModel]):
                 if not list_id:
                     continue
 
-                if isinstance(list_id, int):
-                    list_items = self.api.list_items_by_id(list_id)
-                else:
-                    list_items = self.api.list_items_by_url(list_id)
+                # Isolate the fetch per list (patch 0037). This whole loop
+                # sits in one try, so any list that fails to parse killed
+                # every list after it too - the release_year break above
+                # took out lists 2..6 of 6, not just the one bad row.
+                # Rate limiting still aborts the run (re-raised to the
+                # outer handler); a bad list is logged and skipped.
+                try:
+                    if isinstance(list_id, int):
+                        list_items = self.api.list_items_by_id(list_id)
+                    else:
+                        list_items = self.api.list_items_by_url(list_id)
+                except Exception as e:
+                    if "rate limit" in str(e).lower() or "429" in str(e):
+                        raise
+
+                    logger.error(f"Mdblist error on list {list_id}: {e}")
+                    continue
 
                 assert list_items
 
