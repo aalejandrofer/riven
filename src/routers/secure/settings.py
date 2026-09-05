@@ -182,7 +182,8 @@ async def set_all_settings(
     # Validate and save the updated settings
     try:
         updated_settings = settings_manager.settings.model_validate(current_settings)
-        settings_manager.load(settings_dict=updated_settings.model_dump())
+        # Patch 0017: skip observer notify — full reinit takes ~60s.
+        settings_manager.load(settings_dict=updated_settings.model_dump(), notify=False)
         settings_manager.save()  # Ensure the changes are persisted
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -250,7 +251,8 @@ async def set_settings(
 
     try:
         updated_settings = settings_manager.settings.__class__(**current_settings)
-        settings_manager.load(settings_dict=updated_settings.model_dump())
+        # Patch 0017: skip observer notify — full reinit takes ~60s.
+        settings_manager.load(settings_dict=updated_settings.model_dump(), notify=False)
         settings_manager.save()
     except ValidationError as e:
         raise HTTPException(
