@@ -818,6 +818,23 @@ class ScraperModel(Observable):
     dubbed_anime_only: bool = Field(
         default=False, description="Only scrape dubbed anime content"
     )
+    release_window_hours: float = Field(
+        default=24,
+        ge=0,
+        description=(
+            "Hours after an item airs during which it is re-scraped on a short "
+            "fixed interval instead of the after_2/after_5/after_10 backoff. "
+            "0 disables the release window."
+        ),
+    )
+    release_retry_minutes: float = Field(
+        default=30,
+        ge=5,
+        description=(
+            "Interval between re-scrapes while an item is inside its release "
+            "window."
+        ),
+    )
     torrentio: TorrentioConfig = Field(
         default_factory=lambda: TorrentioConfig(), description="Torrentio configuration"
     )
