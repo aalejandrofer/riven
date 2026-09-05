@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, TypedDict
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -447,7 +447,20 @@ class ProgramScheduler:
         ongoing_shows = (
             session.execute(
                 select(Show).where(
-                    Show.last_state.in_([States.Ongoing, States.Unreleased])
+                    or_(
+                        Show.last_state.in_([States.Ongoing, States.Unreleased]),
+                        # Patch 0025: also re-walk shows TVDB still lists as
+                        # airing (Continuing/Upcoming) even if they fell to
+                        # Completed. A show that finishes its current season
+                        # goes Completed and drops out of this reindex
+                        # schedule, so a newly-announced next season is never
+                        # discovered (only an external content-source re-add
+                        # brings it back). Keep re-indexing while TVDB says
+                        # the series is still going.
+                        func.lower(Show.tvdb_status).in_(
+                            ["continuing", "upcoming"]
+                        ),
+                    )
                 )
             )
             .unique()
