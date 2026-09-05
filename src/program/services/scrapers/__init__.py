@@ -8,7 +8,7 @@ from queue import Queue, Empty
 from loguru import logger
 
 from program.core.runner import MediaItemGenerator, Runner, RunnerResult
-from program.media.item import MediaItem
+from program.media.item import MediaItem, Season
 from program.media.state import States
 from program.media.stream import Stream
 from program.services.scrapers.aiostreams import AIOStreams
@@ -24,6 +24,10 @@ from program.services.scrapers.torrentio import Torrentio
 from program.services.scrapers.zilean import Zilean
 from program.settings import settings_manager
 from program.settings.models import Observable, ScraperModel
+
+# Must match the value in program/state_transition.py, which defines its own
+# local copy (it is a function-local there, so it cannot be imported).
+SEASON_PACK_FALLBACK_THRESHOLD = 3
 
 
 class Scraping(Runner[ScraperModel, ScraperService[Observable]]):
@@ -111,7 +115,45 @@ class Scraping(Runner[ScraperModel, ScraperService[Observable]]):
         item.set("scraped_at", datetime.now())
         item.set("scraped_times", item.scraped_times + 1)
 
-        yield RunnerResult(media_items=[item])
+        # A Season with no season pack available must fall back to per-episode
+        # scraping, but NOTHING revisits it to make that happen: this failure
+        # path only bumps failed_attempts and returns, and in steady state the
+        # sole thing that re-emits a Season is _retry_library on a 7-day
+        # interval. Reaching state_transition's SEASON_PACK_FALLBACK_THRESHOLD
+        # of 3 therefore took roughly THREE WEEKS, during which a show whose
+        # releases are all single-episode downloaded nothing at all.
+        #
+        # Observed on Tires (2026-08-24): Comet returned 6-11 per-episode
+        # releases per season that ranked fine (600-10850), the only pack-shaped
+        # candidate was rejected, and all 30 episodes sat at scraped_times=0
+        # with an empty event queue until a human retried them one by one.
+        #
+        # Hand the eligible episodes back now so the fallback happens on this
+        # pass instead of three weeks later. should_submit() still applies its
+        # own backoff, so this cannot spin.
+        follow_up = list[MediaItem]()
+
+        if (
+            not new_streams
+            and isinstance(item, Season)
+            and item.failed_attempts >= SEASON_PACK_FALLBACK_THRESHOLD
+        ):
+            follow_up = [
+                episode
+                for episode in item.episodes
+                if episode.last_state in (States.Indexed, States.Unknown)
+                and self.should_submit(episode)
+            ]
+
+            if follow_up:
+                logger.log(
+                    "SCRAPER",
+                    f"No season pack for {item.log_string} after "
+                    f"{item.failed_attempts} attempts; falling back to "
+                    f"{len(follow_up)} episode(s)",
+                )
+
+        yield RunnerResult(media_items=[item, *follow_up])
 
     def scrape(
         self,
