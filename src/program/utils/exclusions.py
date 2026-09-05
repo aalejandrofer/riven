@@ -8,14 +8,18 @@ if TYPE_CHECKING:
 
 
 class Exclusions:
-    excluded_shows: set[str]
-    excluded_movies: set[str]
+    # Patch 0013: read settings dynamically so /settings/load picks up
+    # excluded_items changes without a restart.
 
-    def __init__(self):
-        excluded_items = settings_manager.settings.filesystem.excluded_items
+    @property
+    def excluded_shows(self) -> set[str]:
+        items = settings_manager.settings.filesystem.excluded_items
+        return set(items.shows or [])
 
-        self.excluded_movies = excluded_items.movies
-        self.excluded_shows = excluded_items.shows
+    @property
+    def excluded_movies(self) -> set[str]:
+        items = settings_manager.settings.filesystem.excluded_items
+        return set(items.movies or [])
 
     def is_excluded(self, item: "MediaItem") -> bool:
         # In v1.0.0, only Show/Season/Episode define top_parent; Movie
