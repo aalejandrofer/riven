@@ -1442,7 +1442,23 @@ async def reindex_item(
                 # Use no_autoflush to prevent SQLAlchemy from trying to flush
                 # the new Season/Episode objects before the merge is complete
                 with s.no_autoflush:
-                    s.merge(runner_result.media_items[0])
+                    merged = s.merge(runner_result.media_items[0])
+
+                # SQLAlchemy 2.0 does NOT auto-cascade a transient child appended
+                # to a persistent parent's collection, so the newly-aired
+                # Season/Episode objects the TVDB indexer just created via
+                # show.add_season()/season.add_episode() are silently dropped on
+                # flush ("Object of type <Season> not in session, add operation
+                # along 'Show.seasons' will not proceed"). Without this the
+                # reindex endpoint returns 200 "Successfully re-indexed" but never
+                # actually adds a new season (or episodes into an existing empty
+                # season shell). Add the children explicitly so they persist.
+                # Same fix as patch 0031's scrape/auto path (patch 0032).
+                if isinstance(merged, Show):
+                    for season in merged.seasons:
+                        s.add(season)
+                        for episode in season.episodes:
+                            s.add(episode)
 
             apply_item_mutation(
                 program=di[Program],
