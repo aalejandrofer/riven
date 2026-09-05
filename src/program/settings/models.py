@@ -231,6 +231,9 @@ class ExcludedItems(BaseModel):
     shows: set[str] = Field(default_factory=set)
     movies: set[str] = Field(default_factory=set)
     infohashes: set[str] = Field(default_factory=set)
+    # Human-readable label per blocklisted infohash (infohash -> "Title S01E02"),
+    # captured at blocklist time. Display-only; the scraper ignores this field.
+    infohash_labels: dict[str, str] = Field(default_factory=dict)
 
 
 class FilesystemModel(Observable):

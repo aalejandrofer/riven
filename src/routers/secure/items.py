@@ -992,8 +992,14 @@ async def blocklist_active_infohash(
         # Add to the global infohash blocklist. The scraper reads this set live
         # (scrapers/shared.py skips any infohash in excluded_items.infohashes),
         # so the mutation takes effect immediately; save() persists it to disk.
-        infohashes = settings_manager.settings.filesystem.excluded_items.infohashes
-        infohashes.add(infohash)
+        excluded = settings_manager.settings.filesystem.excluded_items
+        excluded.infohashes.add(infohash)
+        # Capture a human label NOW (item is in scope; after reset the Stream row
+        # may be pruned, making infohash->media unrecoverable). Display-only on the
+        # Blocklist page; the scraper ignores infohash_labels.
+        label = getattr(item, "log_string", None) or getattr(item, "title", None)
+        if label:
+            excluded.infohash_labels[infohash] = str(label)
         settings_manager.save()
 
         def mutation(i: MediaItem, s: Session):
