@@ -11,6 +11,12 @@ from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, TypedDict
 
+from apscheduler.events import (
+    EVENT_JOB_ERROR,
+    EVENT_JOB_EXECUTED,
+    EVENT_JOB_MISSED,
+    EVENT_JOB_SUBMITTED,
+)
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
@@ -46,12 +52,20 @@ class ProgramScheduler:
     def __init__(self, program: "Program") -> None:
         self.program = program
         self.scheduler = BackgroundScheduler()
+        # APScheduler keeps no execution history, so the Runners view has no
+        # way to answer "did this last run succeed?". Track it ourselves: one
+        # entry per job id, overwritten each run (patch 0034).
+        self.run_history: dict[str, dict] = {}
 
     def start(self) -> None:
         """Create and start the background scheduler with all jobs registered."""
 
         self._schedule_services()
         self._schedule_functions()
+        self.scheduler.add_listener(
+            self._record_job_event,
+            EVENT_JOB_SUBMITTED | EVENT_JOB_EXECUTED | EVENT_JOB_ERROR | EVENT_JOB_MISSED,
+        )
         self.scheduler.start()
 
     def stop(self) -> None:
@@ -59,6 +73,87 @@ class ProgramScheduler:
 
         if self.scheduler and self.scheduler.running:
             self.scheduler.shutdown(wait=False)
+
+    # ---------------------------------------------------------------- runners
+    # Introspection for the frontend Runners tab (patch 0034).
+
+    def _record_job_event(self, event) -> None:
+        """Track start/finish/outcome per job id for the Runners view."""
+
+        entry = self.run_history.setdefault(event.job_id, {})
+
+        if event.code == EVENT_JOB_SUBMITTED:
+            entry["started_at"] = datetime.now()
+            entry["running"] = True
+            return
+
+        entry["running"] = False
+        entry["finished_at"] = datetime.now()
+
+        started = entry.get("started_at")
+        if started:
+            entry["duration_ms"] = int(
+                (entry["finished_at"] - started).total_seconds() * 1000
+            )
+
+        if event.code == EVENT_JOB_ERROR:
+            entry["ok"] = False
+            entry["error"] = str(getattr(event, "exception", "") or "error")
+        elif event.code == EVENT_JOB_MISSED:
+            entry["ok"] = False
+            entry["error"] = "missed (misfire grace exceeded)"
+        else:
+            entry["ok"] = True
+            entry["error"] = None
+
+    @staticmethod
+    def _runner_label(job_id: str) -> str:
+        """Human label for a job id, e.g. _process_scheduled_tasks -> Process scheduled tasks."""
+
+        name = job_id
+        if name.endswith("_update"):
+            return f"{name[: -len('_update')]} content poll"
+        if name.endswith("_update_once"):
+            return f"{name[: -len('_update_once')]} content poll (webhook)"
+        return name.lstrip("_").replace("_", " ").capitalize()
+
+    def runners(self) -> list[dict]:
+        """Snapshot every registered periodic job, with cadence and last run."""
+
+        if not self.scheduler:
+            return []
+
+        out = []
+        for job in self.scheduler.get_jobs():
+            interval = None
+            trigger = getattr(job, "trigger", None)
+            job_interval = getattr(trigger, "interval", None)
+            if job_interval is not None:
+                interval = int(job_interval.total_seconds())
+
+            hist = self.run_history.get(job.id, {})
+
+            def _iso(value):
+                return value.isoformat() if value else None
+
+            out.append(
+                {
+                    "id": job.id,
+                    "label": self._runner_label(job.id),
+                    "interval_seconds": interval,
+                    "trigger": str(trigger) if trigger else None,
+                    "next_run": _iso(getattr(job, "next_run_time", None)),
+                    "running": bool(hist.get("running")),
+                    "last_started": _iso(hist.get("started_at")),
+                    "last_finished": _iso(hist.get("finished_at")),
+                    "last_duration_ms": hist.get("duration_ms"),
+                    "last_ok": hist.get("ok"),
+                    "last_error": hist.get("error"),
+                }
+            )
+
+        out.sort(key=lambda r: (r["next_run"] is None, r["next_run"] or ""))
+        return out
 
     def _schedule_functions(self) -> None:
         """Register internal periodic functions and maintenance tasks."""

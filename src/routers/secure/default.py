@@ -16,6 +16,7 @@ from program.db.db import db_session
 from program.media.item import Episode, MediaItem, Movie, Season, Show
 from program.media.state import States
 from program.program import Program
+from program.scheduling.models import ScheduledStatus, ScheduledTask
 from program.settings import settings_manager
 from program.utils import generate_api_key
 
@@ -170,6 +171,173 @@ async def get_services() -> dict[str, bool]:
                 data[service.key] = service.initialized
 
     return data
+
+
+class RunnerInfo(BaseModel):
+    id: str
+    label: str
+    interval_seconds: int | None = None
+    trigger: str | None = None
+    next_run: str | None = None
+    running: bool = False
+    last_started: str | None = None
+    last_finished: str | None = None
+    last_duration_ms: int | None = None
+    last_ok: bool | None = None
+    last_error: str | None = None
+
+
+class ScheduledTaskInfo(BaseModel):
+    id: int
+    task_type: str
+    status: str
+    scheduled_for: str | None = None
+    executed_at: str | None = None
+    item_id: int | None = None
+    title: str | None = None
+    # Which scheduling branch created this task, e.g. "monitor:next_air" vs
+    # "monitor:fallback_daily" - the quickest way to see why a show reindexes
+    # when it does.
+    reason: str | None = None
+
+
+class PoolInfo(BaseModel):
+    service_name: str
+    worker_count: int
+    in_flight: int
+    cap: int
+    at_cap: bool
+
+
+class RunnersResponse(BaseModel):
+    runners: list[RunnerInfo]
+    pools: list[PoolInfo]
+    task_counts: dict[str, int]
+    task_types: list[dict[str, Any]]
+    upcoming: list[ScheduledTaskInfo]
+    recent: list[ScheduledTaskInfo]
+
+
+@router.get("/runners", operation_id="runners")
+async def get_runners(
+    limit: Annotated[int, Query(ge=1, le=100)] = 25,
+) -> RunnersResponse:
+    """Periodic jobs and the scheduled per-item work they drive.
+
+    Two different things live here (patch 0034):
+      * `runners`  - the APScheduler jobs: content polls and maintenance loops,
+                     with cadence, next fire time and how the last run went.
+      * the rest   - the ScheduledTask rows those runners consume: what is
+                     queued next and what just executed.
+    """
+
+    program = di[Program]
+    # Program owns the ProgramScheduler as ;  on
+    # that object is the raw APScheduler BackgroundScheduler.
+    scheduler = getattr(program, "scheduler_manager", None)
+    runners = scheduler.runners() if scheduler else []
+
+    # Executor pools. worker_count alone is a startup constant and says nothing
+    # about load; the useful number is patch 0021's per-service in-flight count
+    # against MAX_PENDING_PER_SERVICE. At the cap, submit_job stops dispatching
+    # and re-queues with backoff, which is what a stalled pipeline looks like
+    # from the inside.
+    from program.managers.event_manager import MAX_PENDING_PER_SERVICE
+
+    em = getattr(program, "em", None)
+    pools: list[PoolInfo] = []
+
+    if em is not None:
+        workers = {
+            se.service_name: getattr(se.executor, "_max_workers", 0)
+            for se in list(em._executors)
+        }
+        pending = dict(em._pending_per_service)
+
+        for name in sorted(set(workers) | set(pending)):
+            in_flight = pending.get(name, 0)
+            pools.append(
+                PoolInfo(
+                    service_name=name,
+                    worker_count=workers.get(name, 0),
+                    in_flight=in_flight,
+                    cap=MAX_PENDING_PER_SERVICE,
+                    at_cap=in_flight >= MAX_PENDING_PER_SERVICE,
+                )
+            )
+
+    def _iso(value):
+        return value.isoformat() if value else None
+
+    with db_session() as session:
+        counts = {
+            str(status.value if hasattr(status, "value") else status): count
+            for status, count in session.execute(
+                select(ScheduledTask.status, func.count())
+                .group_by(ScheduledTask.status)
+            ).all()
+        }
+
+        task_types = [
+            {
+                "task_type": row[0],
+                "status": str(row[1].value if hasattr(row[1], "value") else row[1]),
+                "count": row[2],
+            }
+            for row in session.execute(
+                select(ScheduledTask.task_type, ScheduledTask.status, func.count())
+                .group_by(ScheduledTask.task_type, ScheduledTask.status)
+                .order_by(ScheduledTask.task_type)
+            ).all()
+        ]
+
+        def _rows(stmt):
+            out = []
+            for task in session.execute(stmt).scalars():
+                title = None
+                if task.item_id:
+                    item = session.get(MediaItem, task.item_id)
+                    if item:
+                        title = item.log_string
+                out.append(
+                    ScheduledTaskInfo(
+                        id=task.id,
+                        task_type=task.task_type,
+                        status=str(
+                            task.status.value
+                            if hasattr(task.status, "value")
+                            else task.status
+                        ),
+                        scheduled_for=_iso(task.scheduled_for),
+                        executed_at=_iso(task.executed_at),
+                        item_id=task.item_id,
+                        title=title,
+                        reason=task.reason,
+                    )
+                )
+            return out
+
+        upcoming = _rows(
+            select(ScheduledTask)
+            .where(ScheduledTask.status == ScheduledStatus.Pending)
+            .order_by(ScheduledTask.scheduled_for.asc())
+            .limit(limit)
+        )
+        recent = _rows(
+            select(ScheduledTask)
+            .where(ScheduledTask.executed_at.is_not(None))
+            .order_by(ScheduledTask.executed_at.desc())
+            .limit(limit)
+        )
+
+    return RunnersResponse(
+        runners=[RunnerInfo(**r) for r in runners],
+        pools=pools,
+        task_counts=counts,
+        task_types=task_types,
+        upcoming=upcoming,
+        recent=recent,
+    )
 
 
 class TraktOAuthInitiateResponse(BaseModel):
