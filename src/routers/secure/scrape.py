@@ -1357,8 +1357,68 @@ async def auto_scrape(
                     seasons_to_pause.append(season)
 
             if not seasons_to_scrape:
+                # Requested season(s) aren't in the DB yet — common when a new
+                # season just started airing and the reindex pool (patch 0025)
+                # hasn't picked it up. Reindex the show from the metadata provider
+                # to pull any newly-available seasons, then retry the match before
+                # giving up. Without this, "Request latest season" on a freshly-
+                # aired season fails until the next scheduled reindex.
+                logger.info(
+                    f"Requested seasons {request.season_numbers} not in DB for "
+                    f"{item.log_string}; reindexing to fetch newly-aired seasons"
+                )
+                services = di[Program].services
+                if services:
+                    item.indexed_at = None
+                    runner_result = next(
+                        services.indexer.run(item, log_msg=True), None
+                    )
+                    if runner_result and runner_result.media_items:
+                        reindexed = runner_result.media_items[0]
+                        with session.no_autoflush:
+                            reindexed = session.merge(reindexed)
+                        # SQLAlchemy 2.0 does NOT auto-cascade a transient child
+                        # appended to a persistent parent's collection, so the
+                        # newly-aired Season/Episode objects the TVDB indexer just
+                        # created via show.add_season() are silently dropped on
+                        # flush ("Object of type <Season> not in session, add
+                        # operation along 'Show.seasons' will not proceed"). This
+                        # is why even the /items/reindex endpoint never adds a new
+                        # season. Add the children explicitly so they persist.
+                        if isinstance(reindexed, Show):
+                            for season in reindexed.seasons:
+                                session.add(season)
+                                for episode in season.episodes:
+                                    session.add(episode)
+                        session.commit()
+                        item = session.execute(
+                            select(Show)
+                            .options(
+                                selectinload(Show.seasons).selectinload(
+                                    Season.episodes
+                                )
+                            )
+                            .where(Show.id == item.id)
+                        ).scalar_one()
+                        seasons_to_scrape = []
+                        seasons_to_pause = []
+                        for season in item.seasons:
+                            if season.number in request.season_numbers:
+                                seasons_to_scrape.append(season)
+                            else:
+                                seasons_to_pause.append(season)
+
+            if not seasons_to_scrape:
                 logger.warning("No matching seasons found in DB for requested numbers")
-                raise HTTPException(status_code=404, detail="No matching seasons found")
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        "Requested season(s) not available yet — not listed on the "
+                        "metadata provider even after a reindex (likely unannounced "
+                        "or unaired). Riven will grab them automatically once they "
+                        "air."
+                    ),
+                )
 
             # 1. Update states first (Unpause selected, Pause unselected)
             for season in seasons_to_scrape:
