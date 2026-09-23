@@ -1,3 +1,15 @@
+# Riven: homelab fork (backend)
+
+A working fork of [rivenmedia/riven](https://github.com/rivenmedia/riven). Upstream's `main` hasn't moved since 2026-04-11 and there are no new releases, so I keep this branch patched for my own self-hosted setup.
+
+It's upstream `06f5a78` with about 23 patches on top. Most of them deal with Real-Debrid's 2026 "Infringing torrent" (451) crackdown: dead streams get blacklisted, the bad infohashes are cached so they aren't retried every cycle, and downloads fall back to AllDebrid. The rest are pipeline and indexing fixes, a user exclusion list, and a few small API additions. The commit log has the per-patch detail.
+
+Worth knowing before you build off it: there's no CI and no support, and the branch is regenerated and force-pushed from a private repo, so its history gets rewritten on every sync. Pin a commit if you depend on it.
+
+The upstream README is below.
+
+---
+
 <div align="center">
   <a href="https://github.com/rivenmedia/riven">
     <picture>
