@@ -113,8 +113,28 @@ def process_event(
                 items_to_submit = [existing_item]
 
     elif existing_item and existing_item.last_state == States.Scraped:
-        next_service = services.downloader
-        items_to_submit = [existing_item]
+        if isinstance(existing_item, Show):
+            # Show-level scrape found streams, but the Downloader cannot act
+            # on a show-level item (silent stuck — see issue #1400). Cascade
+            # to season-level scraping for any seasons that still need it.
+            items_to_submit = [
+                s
+                for s in existing_item.seasons
+                if s.last_state in [States.Indexed, States.Unknown]
+                and services.scraping.should_submit(s)
+            ]
+            if items_to_submit:
+                next_service = services.scraping
+            else:
+                # All seasons already past Indexed/Unknown — fall through to
+                # the downloader so the show progresses (e.g. if seasons are
+                # already Scraped, each is handled individually on its own
+                # event).
+                next_service = services.downloader
+                items_to_submit = [existing_item]
+        else:
+            next_service = services.downloader
+            items_to_submit = [existing_item]
 
     elif existing_item and existing_item.last_state == States.Downloaded:
         next_service = services.filesystem
