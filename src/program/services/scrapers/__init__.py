@@ -1,7 +1,7 @@
 import threading
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from queue import Queue, Empty
 
 
@@ -289,13 +289,46 @@ class Scraping(Runner[ScraperModel, ScraperService[Observable]]):
                     logger.warning("Timeout waiting for scraper results")
                     break
 
+    @staticmethod
+    def in_release_window(item: MediaItem) -> bool:
+        """Return True while an item is within release_window_hours of airing.
+
+        The good releases for a title do not all exist at air time. A 2160p
+        WEB-DL typically lands hours to days later, so the single scrape that
+        fires at aired_at + indexer.schedule_offset_minutes sees only whatever
+        was indexed in the first half hour - often nothing usable, sometimes
+        only a foreign-language rip. The normal backoff then pushes the next
+        attempt hours out and the item keeps whatever it grabbed first, because
+        Riven has no upgrade path once an item reaches Completed.
+
+        Inside the window the item is therefore re-scraped on a short fixed
+        interval instead.
+        """
+
+        settings = settings_manager.settings.scraping
+        window_hours = settings.release_window_hours
+
+        if window_hours <= 0 or not item.aired_at:
+            return False
+
+        age = datetime.now() - item.aired_at
+
+        return timedelta(0) <= age <= timedelta(hours=window_hours)
+
     def should_submit(self, item: MediaItem) -> bool:
         """Check if an item should be submitted for scraping."""
 
         settings = settings_manager.settings.scraping
         scrape_time = 30 * 60  # 30 minutes by default
 
-        if item.scraped_times >= 2 and item.scraped_times <= 5:
+        # A freshly-aired item is exempt from the backoff ladder: the ladder
+        # exists to stop hammering scrapers over a title nothing has, which is
+        # the opposite of the situation in the hours right after air.
+        in_window = self.in_release_window(item)
+
+        if in_window:
+            scrape_time = settings.release_retry_minutes * 60
+        elif item.scraped_times >= 2 and item.scraped_times <= 5:
             scrape_time = settings.after_2 * 60 * 60
         elif item.scraped_times > 5 and item.scraped_times <= 10:
             scrape_time = settings.after_5 * 60 * 60
@@ -310,8 +343,12 @@ class Scraping(Runner[ScraperModel, ScraperService[Observable]]):
         if not is_scrapeable:
             return False
 
+        # max_failed_attempts is a give-up rule for a dead title. Applying it
+        # inside the release window would abandon an item after a handful of
+        # attempts made before any release existed.
         if (
-            settings.max_failed_attempts > 0
+            not in_window
+            and settings.max_failed_attempts > 0
             and item.failed_attempts >= settings.max_failed_attempts
         ):
             return False

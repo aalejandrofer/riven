@@ -693,6 +693,7 @@ class ProgramScheduler:
             with db_session() as session:
                 self._schedule_upcoming_episodes(session, now, offset_seconds)
                 self._schedule_upcoming_movies(session, now, offset_seconds)
+                self._schedule_recent_airings(session, now)
                 self._schedule_ongoing_shows(session, now)
                 self._schedule_unknown_movies(session, now)
         except Exception as e:
@@ -758,6 +759,77 @@ class ProgramScheduler:
                     )
                 except Exception as e:
                     logger.debug(f"Skipping schedule for {ep.log_string}: {e}")
+
+    def _schedule_recent_airings(self, session: Session, now: datetime) -> None:
+        """Keep re-scraping an item for release_window_hours after it airs.
+
+        _schedule_upcoming_episodes only ever schedules a FUTURE air date, so
+        each episode gets exactly one episode_release task, fired at
+        aired_at + indexer.schedule_offset_minutes. If that single attempt
+        scrapes but the downloader takes nothing, the item falls back to Indexed
+        and nothing asks again: should_submit() reports it eligible, but no
+        event is ever produced for it. In steady state the only things that
+        re-emit it are _retry_library (a 7-day interval) and a human.
+
+        Observed on Silo S03E10 (aired 2026-09-04): enqueued at 00:30:08,
+        Torrentio returned nothing and Comet 3 thin streams at 00:30:11,
+        no download followed, and 30 hours later it was still Indexed - while
+        the same query by then returned six clean 2160p candidates, one of which
+        downloaded immediately on a manual retry. The scrape was never the
+        problem; the missing second attempt was.
+
+        This re-arms episode_release for anything that aired inside the window
+        and is not yet Completed. Scraping.should_submit() applies the matching
+        short interval, so the two halves cannot drift apart.
+        """
+
+        settings = settings_manager.settings.scraping
+        window_hours = settings.release_window_hours
+
+        if window_hours <= 0:
+            return
+
+        window_start = now - timedelta(hours=window_hours)
+        retry_delta = timedelta(minutes=settings.release_retry_minutes)
+
+        recent: list[MediaItem] = []
+
+        for model in (Episode, Movie):
+            recent.extend(
+                session.execute(
+                    select(model)
+                    .where(model.aired_at.is_not(None))
+                    .where(model.aired_at >= window_start)
+                    .where(model.aired_at <= now)
+                    .where(~(model.last_state == States.Completed))
+                )
+                .unique()
+                .scalars()
+                .all()
+            )
+
+        task_type_for = {"episode": "episode_release", "movie": "movie_release"}
+
+        for item in recent:
+            task_type = task_type_for.get(item.type)
+
+            if not task_type:
+                continue
+
+            # One pending future task at a time. The already-scheduled first
+            # attempt therefore wins on air night, and this only takes over once
+            # that attempt has been consumed.
+            if self._has_future_task(session, item.id, task_type, now):
+                continue
+
+            try:
+                item.schedule(
+                    now + retry_delta,
+                    task_type=task_type,
+                    reason="monitor:release_window",
+                )
+            except Exception as e:
+                logger.debug(f"Skipping release-window schedule for {item.log_string}: {e}")
 
     def _schedule_upcoming_movies(
         self, session: Session, now: datetime, offset_seconds: int
