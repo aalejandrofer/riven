@@ -70,6 +70,39 @@ class AllDebridModel(Observable):
     api_key: str = Field(default="", description="AllDebrid API key")
 
 
+class DownloaderPriorityRule(Observable):
+    """Per-item override of `downloaders.priority`, selected by release year.
+
+    Debrid services do not fail uniformly across a catalogue: takedowns track
+    recency, so the provider that is right for a 2025 release is often the wrong
+    one for a 1998 release. A single global priority cannot express that, which
+    forces the operator to either accept the wrong provider for part of the
+    library or flip the global setting by hand around bulk work.
+
+    A rule matches when the item's release year falls inside [min_year, max_year]
+    (either bound may be omitted for an open interval). The first matching rule
+    wins; if none match, `downloaders.priority` applies unchanged.
+    """
+
+    name: str = Field(
+        default="", description="Optional label, for logs and readability only"
+    )
+    min_year: int | None = Field(
+        default=None, description="Match items released in or after this year"
+    )
+    max_year: int | None = Field(
+        default=None, description="Match items released in or before this year"
+    )
+    priority: list[str] = Field(
+        default_factory=lambda: list[str](),
+        description=(
+            "Downloader keys to try, in order, for items matching this rule. "
+            "Same semantics as downloaders.priority: unknown keys are ignored "
+            "and initialized services not named here are tried afterwards."
+        ),
+    )
+
+
 class DownloadersModel(Observable):
     video_extensions: list[str] = Field(
         default_factory=lambda: list[str](["mp4", "mkv", "avi"]),
@@ -105,6 +138,17 @@ class DownloadersModel(Observable):
             "initialized service not named here keeps its declaration order "
             "after the ones that are; unrecognised names are logged and "
             "ignored. The default reproduces the historical hardcoded order."
+        ),
+    )
+    priority_rules: list[DownloaderPriorityRule] = Field(
+        default_factory=lambda: list[DownloaderPriorityRule](),
+        description=(
+            "Optional per-item overrides of `priority`, matched on release "
+            "year. The first rule whose [min_year, max_year] window contains "
+            "the item's year wins; otherwise `priority` is used. Lets a "
+            "library keep scarce capacity on one service for recent releases "
+            "while older ones prefer another, without flipping a global "
+            "setting by hand."
         ),
     )
     real_debrid: RealDebridModel = Field(

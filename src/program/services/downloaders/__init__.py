@@ -69,7 +69,9 @@ class Downloader(Runner[None, DownloaderBase]):
         )
 
     def _order_by_priority(
-        self, services: list[DownloaderBase]
+        self,
+        services: list[DownloaderBase],
+        priority: list[str] | None = None,
     ) -> list[DownloaderBase]:
         """Order the initialized downloaders by `downloaders.priority`.
 
@@ -86,7 +88,8 @@ class Downloader(Runner[None, DownloaderBase]):
         - an unrecognised key is logged and skipped, never raised, so a typo
           cannot stop the program from starting.
         """
-        priority = settings_manager.settings.downloaders.priority or []
+        if priority is None:
+            priority = settings_manager.settings.downloaders.priority or []
 
         known = {service.key for service in self.services.values()}
         remaining = {service.key: service for service in services}
@@ -114,6 +117,59 @@ class Downloader(Runner[None, DownloaderBase]):
         )
 
         return ordered
+
+    @staticmethod
+    def _release_year(item: MediaItem) -> int | None:
+        """Release year for routing, walking up to a parent when unset.
+
+        An Episode usually carries no year of its own -- the year lives on the
+        Show -- so routing on the item alone would leave most of a TV library
+        unmatched and silently fall back to the global order.
+        """
+        seen = 0
+        node: MediaItem | None = item
+
+        while node is not None and seen < 3:      # episode -> season -> show
+            year = getattr(node, "year", None)
+
+            if year:
+                return int(year)
+
+            node = getattr(node, "parent", None)
+            seen += 1
+
+        return None
+
+    def _priority_for(self, item: MediaItem) -> list[str] | None:
+        """First `downloaders.priority_rules` entry matching this item's year."""
+        rules = getattr(
+            settings_manager.settings.downloaders, "priority_rules", None
+        ) or []
+
+        if not rules:
+            return None
+
+        year = self._release_year(item)
+
+        if year is None:
+            return None
+
+        for rule in rules:
+            if rule.min_year is not None and year < rule.min_year:
+                continue
+            if rule.max_year is not None and year > rule.max_year:
+                continue
+            if not rule.priority:
+                continue
+
+            logger.debug(
+                f"Downloader routing: {item.log_string} ({year}) matched rule "
+                f"'{rule.name or 'unnamed'}' -> {', '.join(rule.priority)}"
+            )
+
+            return list(rule.priority)
+
+        return None
 
     def validate(self):
         if not self.initialized_services:
@@ -144,6 +200,17 @@ class Downloader(Runner[None, DownloaderBase]):
             if service.key not in self._service_cooldowns
             or self._service_cooldowns[service.key] <= now
         ]
+
+        # Per-item routing (patch 0047). Reordering happens AFTER the cooldown
+        # filter so a rule can never resurrect a service whose circuit breaker
+        # is open, and it only ever reorders -- every available service stays
+        # reachable, so a rule cannot strand an item on one provider.
+        item_priority = self._priority_for(item)
+
+        if item_priority:
+            available_services = self._order_by_priority(
+                available_services, item_priority
+            )
 
         if not available_services:
             # All services are in cooldown, reschedule for the earliest available time
