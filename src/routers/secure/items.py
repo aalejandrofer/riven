@@ -18,6 +18,7 @@ from program.media.state import States
 from program.types import Event
 from program.program import Program
 from program.media.models import MediaMetadata
+from program.settings import settings_manager
 
 from ..models.shared import IdListPayload, MessageResponse
 
@@ -944,6 +945,78 @@ async def get_item_streams(
         message=f"Retrieved streams for item {item_id}",
         streams=[stream.to_dict() for stream in item.streams],
         blacklisted_streams=[stream.to_dict() for stream in item.blacklisted_streams],
+    )
+
+
+@router.post(
+    "/{item_id}/blocklist_active",
+    summary="Blocklist Active Infohash",
+    description=(
+        "Add the item's currently-active stream infohash to the GLOBAL blocklist "
+        "(filesystem.excluded_items.infohashes -> the scraper skips it everywhere, "
+        "and it shows on the Blocklist page), blacklist it for this item, and reset "
+        "so the item re-scrapes a different release. Use to ditch a bad pick "
+        "(wrong audio/language) without blocklisting the whole title."
+    ),
+    operation_id="blocklist_active_infohash",
+    response_model=MessageResponse,
+)
+async def blocklist_active_infohash(
+    item_id: Annotated[
+        int,
+        Path(description="The ID of the media item", ge=1),
+    ],
+) -> MessageResponse:
+    with db_session() as session:
+        item = (
+            session.execute(select(MediaItem).where(MediaItem.id == item_id))
+            .unique()
+            .scalar_one_or_none()
+        )
+
+        if not item:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Item not found",
+            )
+
+        active = item.active_stream
+        infohash = getattr(active, "infohash", None) if active else None
+
+        if not infohash:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Item has no active stream / infohash to blocklist",
+            )
+
+        # Add to the global infohash blocklist. The scraper reads this set live
+        # (scrapers/shared.py skips any infohash in excluded_items.infohashes),
+        # so the mutation takes effect immediately; save() persists it to disk.
+        infohashes = settings_manager.settings.filesystem.excluded_items.infohashes
+        infohashes.add(infohash)
+        settings_manager.save()
+
+        def mutation(i: MediaItem, s: Session):
+            # Mirror /reset: drop the current pick + reset so it re-scrapes.
+            # The blocklisted infohash is now skipped, so it can't be re-grabbed.
+            i.blacklist_active_stream()
+            if isinstance(i, (Show, Season)):
+                _reset_scrape_state(i)
+            else:
+                i.reset()
+
+        apply_item_mutation(
+            di[Program],
+            session,
+            item,
+            mutation,
+            bubble_parents=True,
+        )
+
+        session.commit()
+
+    return MessageResponse(
+        message=f"Blocklisted infohash {infohash} for item {item_id}; re-scraping.",
     )
 
 
