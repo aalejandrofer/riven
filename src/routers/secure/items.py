@@ -146,6 +146,362 @@ async def get_states() -> StateResponse:
     return StateResponse(states=[state._name_ for state in States], success=True)
 
 
+# ---------------------------------------------------------------------------
+# Patch 0038: per-item blacklisted releases (StreamBlacklistRelation)
+#
+# There are TWO unrelated blacklists in this deployment:
+#   * the GLOBAL infohash blocklist -- filesystem.excluded_items.infohashes,
+#     written only by patch 0029's "Blocklist this file"; already on /blocklist.
+#   * the PER-ITEM stream blacklist -- the StreamBlacklistRelation table,
+#     written automatically by patch 0002 on every RD 451 and by
+#     MediaItem.blacklist_active_stream(). Nothing rendered it, so it silently
+#     grew to thousands of rows.
+#
+# This endpoint makes the second one readable. Removal reuses the stock
+# POST /items/{item_id}/streams/{stream_id}/unblacklist -- no new write path.
+#
+# NOTE ON ROUTE ORDER: this must stay ABOVE `GET /{id}` (Starlette matches in
+# registration order and `/{id}` would swallow `/blacklisted_streams`).
+# ---------------------------------------------------------------------------
+
+
+class BlacklistedStreamEntry(BaseModel):
+    relation_id: Annotated[
+        int,
+        Field(description="StreamBlacklistRelation row id (ordering key)"),
+    ]
+    stream_id: Annotated[
+        int,
+        Field(description="Stream id -- pass to /streams/{stream_id}/unblacklist"),
+    ]
+    infohash: Annotated[str, Field(description="Torrent infohash")]
+    raw_title: Annotated[str, Field(description="Release name as scraped")]
+    parsed_title: Annotated[str | None, Field(description="RTN parsed title")] = None
+    rank: Annotated[int | None, Field(description="RTN rank")] = None
+    resolution: Annotated[str | None, Field(description="Parsed resolution")] = None
+    flagged_451_services: Annotated[
+        list[str],
+        Field(
+            description=(
+                "Debrid services that returned 451 for this hash (patch 0011). "
+                "Non-empty means the 451 gate already skips it, so the blacklist "
+                "row is redundant."
+            )
+        ),
+    ] = []
+
+
+class BlacklistedItemGroup(BaseModel):
+    item_id: Annotated[int, Field(description="Riven MediaItem id")]
+    title: Annotated[str, Field(description="Display title (log_string shape)")]
+    type: Annotated[str, Field(description="movie / show / season / episode")]
+    state: Annotated[str | None, Field(description="last_state of the item")] = None
+    poster_path: Annotated[str | None, Field(description="Poster, item or root")] = None
+    root_id: Annotated[
+        int | None,
+        Field(description="Top-level ancestor MediaItem id (show or movie)"),
+    ] = None
+    root_type: Annotated[str | None, Field(description="show / movie")] = None
+    root_title: Annotated[str | None, Field(description="Ancestor title")] = None
+    tvdb_id: Annotated[str | None, Field(description="Ancestor tvdb id (shows)")] = None
+    tmdb_id: Annotated[str | None, Field(description="Ancestor tmdb id (movies)")] = None
+    imdb_id: Annotated[str | None, Field(description="Ancestor imdb id")] = None
+    count: Annotated[int, Field(description="Blacklisted releases in this group")]
+    newest_relation_id: Annotated[
+        int,
+        Field(description="Highest relation id in the group (sort key)"),
+    ]
+    streams: Annotated[
+        list[BlacklistedStreamEntry],
+        Field(description="The blacklisted releases, newest first"),
+    ]
+
+
+class BlacklistedStreamsResponse(BaseModel):
+    success: Annotated[bool, Field(description="Request succeeded")]
+    page: Annotated[int, Field(description="Current page number")]
+    limit: Annotated[int, Field(description="Items (not releases) per page")]
+    total_items: Annotated[int, Field(description="Distinct items after filters")]
+    total_pages: Annotated[int, Field(description="Total pages after filters")]
+    total_relations: Annotated[
+        int,
+        Field(description="Blacklist rows after filters"),
+    ]
+    hidden_451: Annotated[
+        int,
+        Field(
+            description=(
+                "Rows matching the search that are hidden because their stream is "
+                "451-flagged. Reported even when include_451 is true, so the UI can "
+                "label the toggle."
+            )
+        ),
+    ]
+    items: Annotated[list[BlacklistedItemGroup], Field(description="One group per item")]
+
+
+def _bl_state_name(value: Any) -> str | None:
+    if value is None:
+        return None
+    return getattr(value, "name", None) or str(value)
+
+
+def _bl_flags(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    return []
+
+
+@router.get(
+    "/blacklisted_streams",
+    summary="List Per-Item Blacklisted Streams",
+    description=(
+        "Paginated view of the per-item stream blacklist (StreamBlacklistRelation), "
+        "grouped one entry per media item and ordered newest-first by row id -- the "
+        "table has no timestamp. This is NOT the global infohash blocklist "
+        "(filesystem.excluded_items.infohashes); the two are unrelated. "
+        "Remove an entry with POST /items/{item_id}/streams/{stream_id}/unblacklist."
+    ),
+    operation_id="get_blacklisted_streams",
+    response_model=BlacklistedStreamsResponse,
+)
+async def get_blacklisted_streams(
+    page: Annotated[
+        int,
+        Query(description="Page number", ge=1),
+    ] = 1,
+    limit: Annotated[
+        int,
+        Query(description="Items per page", ge=1, le=100),
+    ] = 25,
+    search: Annotated[
+        str | None,
+        Query(description="Case-insensitive match on the item or its show title"),
+    ] = None,
+    include_451: Annotated[
+        bool,
+        Query(
+            description=(
+                "Include releases whose stream is already 451-flagged. These are "
+                "skipped by the 451 gate anyway, so they default to hidden."
+            )
+        ),
+    ] = False,
+) -> BlacklistedStreamsResponse:
+    from sqlalchemy import or_
+
+    from program.media.stream import Stream, StreamBlacklistRelation
+
+    rel_t = StreamBlacklistRelation.__table__
+    stream_t = Stream.__table__
+    item_t = MediaItem.__table__
+    ep_t = Episode.__table__
+    season_of_ep = Season.__table__.alias("bl_season_of_ep")
+    season_self = Season.__table__.alias("bl_season_self")
+    root_t = MediaItem.__table__.alias("bl_root")
+
+    # MediaItem -> (season of episode | season itself) -> top-level show, or the
+    # item itself for movies/shows. Joined-inheritance means parent_id lives on
+    # the Episode/Season child tables, not on MediaItem.
+    root_id_expr = func.coalesce(
+        season_of_ep.c.parent_id,
+        season_self.c.parent_id,
+        item_t.c.id,
+    )
+
+    joined = (
+        rel_t.join(stream_t, stream_t.c.id == rel_t.c.stream_id)
+        .join(item_t, item_t.c.id == rel_t.c.media_item_id)
+        .outerjoin(ep_t, ep_t.c.id == item_t.c.id)
+        .outerjoin(season_of_ep, season_of_ep.c.id == ep_t.c.parent_id)
+        .outerjoin(season_self, season_self.c.id == item_t.c.id)
+        .outerjoin(root_t, root_t.c.id == root_id_expr)
+    )
+
+    not_flagged = func.json_array_length(stream_t.c.flagged_451_services) == 0
+
+    search_clauses = []
+    term = (search or "").strip()
+
+    if term:
+        like = f"%{term}%"
+        search_clauses.append(
+            or_(item_t.c.title.ilike(like), root_t.c.title.ilike(like))
+        )
+
+    filters = list(search_clauses)
+
+    if not include_451:
+        filters.append(not_flagged)
+
+    with db_session() as session:
+        total_relations = (
+            session.execute(
+                select(func.count()).select_from(joined).where(*filters)
+            ).scalar_one()
+            or 0
+        )
+        total_items = (
+            session.execute(
+                select(func.count(rel_t.c.media_item_id.distinct()))
+                .select_from(joined)
+                .where(*filters)
+            ).scalar_one()
+            or 0
+        )
+        hidden_451 = (
+            session.execute(
+                select(func.count())
+                .select_from(joined)
+                .where(*search_clauses, ~not_flagged)
+            ).scalar_one()
+            or 0
+        )
+
+        groups = session.execute(
+            select(
+                rel_t.c.media_item_id.label("mid"),
+                func.max(rel_t.c.id).label("newest"),
+                func.count().label("cnt"),
+            )
+            .select_from(joined)
+            .where(*filters)
+            .group_by(rel_t.c.media_item_id)
+            .order_by(func.max(rel_t.c.id).desc())
+            .limit(limit)
+            .offset((page - 1) * limit)
+        ).all()
+
+        item_ids = [row.mid for row in groups]
+
+        if not item_ids:
+            return BlacklistedStreamsResponse(
+                success=True,
+                page=page,
+                limit=limit,
+                total_items=total_items,
+                total_pages=(total_items + limit - 1) // limit,
+                total_relations=total_relations,
+                hidden_451=hidden_451,
+                items=[],
+            )
+
+        meta_filters = [item_t.c.id.in_(item_ids)]
+        meta_rows = session.execute(
+            select(
+                item_t.c.id,
+                item_t.c.title,
+                item_t.c.type,
+                item_t.c.last_state,
+                item_t.c.poster_path,
+                ep_t.c.number.label("episode_number"),
+                season_of_ep.c.number.label("episode_season_number"),
+                season_self.c.number.label("season_number"),
+                root_t.c.id.label("root_id"),
+                root_t.c.type.label("root_type"),
+                root_t.c.title.label("root_title"),
+                root_t.c.poster_path.label("root_poster_path"),
+                root_t.c.tvdb_id.label("root_tvdb_id"),
+                root_t.c.tmdb_id.label("root_tmdb_id"),
+                root_t.c.imdb_id.label("root_imdb_id"),
+            )
+            .select_from(
+                item_t.outerjoin(ep_t, ep_t.c.id == item_t.c.id)
+                .outerjoin(season_of_ep, season_of_ep.c.id == ep_t.c.parent_id)
+                .outerjoin(season_self, season_self.c.id == item_t.c.id)
+                .outerjoin(root_t, root_t.c.id == root_id_expr)
+            )
+            .where(*meta_filters)
+        ).all()
+        meta_by_id = {row.id: row for row in meta_rows}
+
+        stream_filters = [rel_t.c.media_item_id.in_(item_ids)]
+
+        if not include_451:
+            stream_filters.append(not_flagged)
+
+        stream_rows = session.execute(
+            select(
+                rel_t.c.id.label("relation_id"),
+                rel_t.c.media_item_id.label("mid"),
+                stream_t.c.id.label("stream_id"),
+                stream_t.c.infohash,
+                stream_t.c.raw_title,
+                stream_t.c.parsed_title,
+                stream_t.c.rank,
+                stream_t.c.resolution,
+                stream_t.c.flagged_451_services,
+            )
+            .select_from(rel_t.join(stream_t, stream_t.c.id == rel_t.c.stream_id))
+            .where(*stream_filters)
+            .order_by(rel_t.c.id.desc())
+        ).all()
+
+    streams_by_item: dict[int, list[BlacklistedStreamEntry]] = {}
+
+    for row in stream_rows:
+        streams_by_item.setdefault(row.mid, []).append(
+            BlacklistedStreamEntry(
+                relation_id=row.relation_id,
+                stream_id=row.stream_id,
+                infohash=row.infohash,
+                raw_title=row.raw_title,
+                parsed_title=row.parsed_title,
+                rank=row.rank,
+                resolution=row.resolution,
+                flagged_451_services=_bl_flags(row.flagged_451_services),
+            )
+        )
+
+    items: list[BlacklistedItemGroup] = []
+
+    for group in groups:
+        meta = meta_by_id.get(group.mid)
+
+        if meta is None:
+            continue
+
+        root_title = meta.root_title or meta.title or f"Item {group.mid}"
+
+        if meta.type == "episode" and meta.episode_number is not None:
+            season_number = meta.episode_season_number or 0
+            title = f"{root_title} S{season_number:02}E{meta.episode_number:02}"
+        elif meta.type == "season" and meta.season_number is not None:
+            title = f"{root_title} S{meta.season_number:02}"
+        else:
+            title = meta.title or root_title
+
+        items.append(
+            BlacklistedItemGroup(
+                item_id=group.mid,
+                title=title,
+                type=meta.type,
+                state=_bl_state_name(meta.last_state),
+                poster_path=meta.poster_path or meta.root_poster_path,
+                root_id=meta.root_id,
+                root_type=meta.root_type,
+                root_title=meta.root_title,
+                tvdb_id=meta.root_tvdb_id,
+                tmdb_id=meta.root_tmdb_id,
+                imdb_id=meta.root_imdb_id,
+                count=group.cnt,
+                newest_relation_id=group.newest,
+                streams=streams_by_item.get(group.mid, []),
+            )
+        )
+
+    return BlacklistedStreamsResponse(
+        success=True,
+        page=page,
+        limit=limit,
+        total_items=total_items,
+        total_pages=(total_items + limit - 1) // limit,
+        total_relations=total_relations,
+        hidden_451=hidden_451,
+        items=items,
+    )
+
+
 class ItemsResponse(BaseModel):
     success: Annotated[
         bool,
