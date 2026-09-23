@@ -99,7 +99,11 @@ class MdblistAPI:
                 imdb_id: StrictStr | None = None
                 tvdbid: StrictInt | None = None
                 mediatype: Literal["movie", "show"]
-                release_year: StrictInt
+                # MDBList emits release_year: null for titles whose date it
+                # has no record of (patch 0037). A required StrictInt made a
+                # single such row abort the whole list fetch. The field is
+                # parsed and never read, so accepting null costs nothing.
+                release_year: StrictInt | None = None
 
                 @property
                 def tvdb_id(self) -> StrictInt | None:
