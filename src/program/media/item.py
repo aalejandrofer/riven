@@ -416,7 +416,7 @@ class MediaItem(MappedAsDataclass, Base, kw_only=True):
         if self.last_state == States.Paused:
             return States.Paused
 
-        if self.last_state == States.Excluded:
+        if self.last_state == States.Excluded and self.is_excluded:
             return States.Excluded
 
         if self.last_state == States.Failed:
@@ -876,7 +876,7 @@ class Show(MediaItem):
             return States.Paused
 
         # Patch 0012: same stickiness for user-excluded shows.
-        if self.last_state == States.Excluded:
+        if self.last_state == States.Excluded and self.is_excluded:
             return States.Excluded
 
         if len(self.seasons) > 0:
@@ -1072,7 +1072,7 @@ class Season(MediaItem):
             return States.Paused
 
         # Patch 0012: sticky Excluded.
-        if self.last_state == States.Excluded:
+        if self.last_state == States.Excluded and self.is_excluded:
             return States.Excluded
 
         if len(self.episodes) > 0:
