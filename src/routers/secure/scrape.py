@@ -1302,6 +1302,33 @@ class StatelessSelectFilesRequest(BaseModel):
     media_type: Literal["movie", "tv"] | None = None
 
 
+def _season_has_gap(season) -> bool:
+    """True when a season's episodes are not a contiguous run starting at 1.
+
+    Patches 0031/0032 reindex a season that is absent or an empty shell, but a
+    season holding 7 of 8 episodes satisfies both gates, so a hole never heals:
+    deleting an episode (the frontend trash calls DELETE /items/remove, which
+    drops the row) left the season permanently short and re-requesting the show
+    did nothing. Numbering is contiguous from 1 for ordinary seasons, so a
+    missing first or middle episode shows up as a gap without asking the
+    metadata provider anything (patch 0036).
+
+    Specials (season 0) are skipped - they are legitimately sparse.
+    """
+
+    if getattr(season, "number", 0) in (None, 0):
+        return False
+
+    numbers = sorted(
+        ep.number for ep in season.episodes if getattr(ep, "number", None)
+    )
+
+    if not numbers:
+        return False  # empty shell: already covered by patch 0032
+
+    return numbers != list(range(1, numbers[-1] + 1))
+
+
 @router.post(
     "/auto",
     summary="Trigger auto scraping for an item or specific seasons",
@@ -1362,8 +1389,12 @@ async def auto_scrape(
             # prior index — the "not in DB" gate wouldn't fire for it, yet there
             # are no episodes to scrape. Treating an empty shell like a missing
             # season pulls its newly-aired episodes (patch 0032; extends 0031).
-            if not seasons_to_scrape or any(
-                len(s.episodes) == 0 for s in seasons_to_scrape
+            if (
+                not seasons_to_scrape
+                or any(len(s.episodes) == 0 for s in seasons_to_scrape)
+                # patch 0036: also heal a season missing an episode from the
+                # middle or the front, which both gates above let through
+                or any(_season_has_gap(s) for s in seasons_to_scrape)
             ):
                 # Requested season(s) aren't in the DB yet — common when a new
                 # season just started airing and the reindex pool (patch 0025)
