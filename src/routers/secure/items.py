@@ -815,13 +815,32 @@ async def get_item(
         match media_type:
             case "movie":
                 # needs to be a string
+                # Constrain to the requested TYPE. TMDB gives movies and shows
+                # separate id spaces, so a bare tmdb_id match can also hit a show.
                 query = select(MediaItem).where(
                     MediaItem.tmdb_id == id,
+                    MediaItem.type == "movie",
                 )
             case "tv":
                 # needs to be a string
+                #
+                # TVDB numbers SERIES and EPISODES in separate id spaces, so the
+                # same integer is routinely both a valid series id and a valid
+                # episode id. Without a type filter this matched seasons and
+                # episodes too, and `scalar_one_or_none()` then raised, which the
+                # handler below turns into a 500:
+                #
+                #   {"detail":"Multiple items found with ID 446718: {87482, 54227}"}
+                #
+                # 87482 is the SHOW "Tires"; 54227 is an unrelated EPISODE that
+                # merely shares the number. The frontend detail loader catches
+                # that failure and falls back to its not-in-library branch, so an
+                # item that IS in the library renders as "Request" with every
+                # action missing. Measured on this deployment: 8 shows affected
+                # out of 1,018, against 42,911 episodes carrying a tvdb_id.
                 query = select(MediaItem).where(
                     MediaItem.tvdb_id == id,
+                    MediaItem.type == "show",
                 )
             case "item":
                 # needs to be an integer
