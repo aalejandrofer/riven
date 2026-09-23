@@ -1356,7 +1356,15 @@ async def auto_scrape(
                 else:
                     seasons_to_pause.append(season)
 
-            if not seasons_to_scrape:
+            # Reindex when a requested season is either absent OR present as an
+            # episode-less shell. A season row can exist with zero episodes when
+            # the SQLAlchemy cascade drop (see below) left the shell empty on a
+            # prior index — the "not in DB" gate wouldn't fire for it, yet there
+            # are no episodes to scrape. Treating an empty shell like a missing
+            # season pulls its newly-aired episodes (patch 0032; extends 0031).
+            if not seasons_to_scrape or any(
+                len(s.episodes) == 0 for s in seasons_to_scrape
+            ):
                 # Requested season(s) aren't in the DB yet — common when a new
                 # season just started airing and the reindex pool (patch 0025)
                 # hasn't picked it up. Reindex the show from the metadata provider
@@ -1408,7 +1416,9 @@ async def auto_scrape(
                             else:
                                 seasons_to_pause.append(season)
 
-            if not seasons_to_scrape:
+            if not seasons_to_scrape or all(
+                len(s.episodes) == 0 for s in seasons_to_scrape
+            ):
                 logger.warning("No matching seasons found in DB for requested numbers")
                 raise HTTPException(
                     status_code=404,
