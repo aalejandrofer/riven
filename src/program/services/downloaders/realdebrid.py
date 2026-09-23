@@ -169,43 +169,53 @@ class RealDebridDownloader(DownloaderBase):
         self.key = "realdebrid"
         self.settings = settings_manager.settings.downloaders.real_debrid
         self.api: RealDebridAPI | None = None
-        # In-memory set of infohashes RD has flagged as 451 / infringing.
-        # Populated from the Stream.blacklisted column on init (so it
-        # survives restarts) and written through on every 451 we see.
-        self._infringing_hashes: set[str] = set()
+        # Patch 0011: in-memory set of infohashes RD has flagged 451.
+        # Populated from Stream.flagged_451_services (filtered for our
+        # service key) at init; written through on every 451 we observe.
+        self._451_hashes: set[str] = set()
         self.initialized = self.validate()
         if self.initialized:
-            self._load_infringing_hashes()
+            self._load_451_hashes()
 
-    def _load_infringing_hashes(self) -> None:
-        """Populate the in-memory 451 set from the Stream.blacklisted column."""
+    def _load_451_hashes(self) -> None:
+        """Populate _451_hashes from Stream.flagged_451_services where our key is present."""
         try:
             from program.db.db import db_session
             from program.media.stream import Stream
             from sqlalchemy import select
             with db_session() as s:
                 rows = s.execute(
-                    select(Stream.infohash).where(Stream.blacklisted.is_(True)).distinct()
-                ).scalars().all()
-                self._infringing_hashes.update(rows)
-            if self._infringing_hashes:
+                    select(Stream.infohash, Stream.flagged_451_services)
+                ).all()
+                for infohash, services in rows:
+                    if services and self.key in services:
+                        self._451_hashes.add(infohash)
+            if self._451_hashes:
                 logger.info(
-                    f"Real-Debrid: pre-loaded {len(self._infringing_hashes)} known-infringing infohashes from DB"
+                    f"Real-Debrid: pre-loaded {len(self._451_hashes)} known-451 infohashes from DB"
                 )
         except Exception as e:
-            logger.warning(f"Failed to load infringing hashes from DB: {e}")
+            logger.warning(f"Failed to load 451 hashes from DB: {e}")
 
-    def _mark_infohash_blacklisted_in_db(self, infohash: str) -> None:
-        """Mark all Stream rows with this infohash as blacklisted."""
+    def _mark_infohash_451_in_db(self, infohash: str) -> None:
+        """Append our service key to flagged_451_services for every Stream row with this hash."""
         try:
             from program.db.db import db_session
             from program.media.stream import Stream
-            from sqlalchemy import update
+            from sqlalchemy import select
             with db_session() as s:
-                s.execute(update(Stream).where(Stream.infohash == infohash).values(blacklisted=True))
-                s.commit()
+                streams = s.execute(select(Stream).where(Stream.infohash == infohash)).scalars().all()
+                changed = False
+                for st in streams:
+                    services = list(st.flagged_451_services or [])
+                    if self.key not in services:
+                        services.append(self.key)
+                        st.flagged_451_services = services
+                        changed = True
+                if changed:
+                    s.commit()
         except Exception as e:
-            logger.debug(f"Failed to persist blacklist for {infohash}: {e}")
+            logger.debug(f"Failed to persist 451 for {infohash}: {e}")
 
     def validate(self) -> bool:
         """
@@ -274,7 +284,7 @@ class RealDebridDownloader(DownloaderBase):
         torrent_id: str | None = None
 
         # Skip hashes already flagged as infringing in this process.
-        if infohash in self._infringing_hashes:
+        if infohash in self._451_hashes:
             raise InfringingTorrentException(infohash)
 
         try:
@@ -334,8 +344,8 @@ class RealDebridDownloader(DownloaderBase):
             # Cache the hash (in-memory + DB) so subsequent items with the same
             # hash skip RD entirely, even across container restarts.
             if "[451]" in error_msg:
-                self._infringing_hashes.add(infohash)
-                self._mark_infohash_blacklisted_in_db(infohash)
+                self._451_hashes.add(infohash)
+                self._mark_infohash_451_in_db(infohash)
                 raise InfringingTorrentException(infohash)
 
             return None
