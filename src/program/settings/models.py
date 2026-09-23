@@ -94,6 +94,19 @@ class DownloadersModel(Observable):
     proxy_url: EmptyOrUrl = Field(
         default="", description="Proxy URL for downloaders (optional)"
     )
+    priority: list[str] = Field(
+        default_factory=lambda: list[str](
+            ["realdebrid", "debridlink", "alldebrid"]
+        ),
+        description=(
+            "Order in which initialized downloaders are tried, by service key "
+            "(realdebrid, debridlink, alldebrid). The first entry that is "
+            "actually initialized becomes the primary downloader. Any "
+            "initialized service not named here keeps its declaration order "
+            "after the ones that are; unrecognised names are logged and "
+            "ignored. The default reproduces the historical hardcoded order."
+        ),
+    )
     real_debrid: RealDebridModel = Field(
         default_factory=lambda: RealDebridModel(),
         description="Real-Debrid downloader configuration",
