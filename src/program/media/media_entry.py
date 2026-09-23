@@ -130,11 +130,12 @@ class MediaEntry(FilesystemEntry):
             original_filename=self.original_filename,
         )
 
-        # ALWAYS include the base path (/movies or /shows)
-        # This is non-configurable and ensures every item is accessible
-        all_paths = [canonical_path]
+        # Collect the paths contributed by matching library profiles first, so we
+        # know whether any of them claims the item exclusively before deciding
+        # whether the base path applies.
+        profile_paths: list[str] = []
+        exclusive = False
 
-        # Add additional paths from library profiles (optional filtered views)
         if self.library_profiles:
             profiles = settings_manager.settings.filesystem.library_profiles
 
@@ -147,9 +148,22 @@ class MediaEntry(FilesystemEntry):
                 # Always use full path structure with /movies or /shows
                 # This ensures consistent directory structure across all library profiles
                 # e.g., /kids/movies/Movie.mkv and /kids/shows/Show.mkv
-                profile_path = f"{profile.library_path}{canonical_path}"
+                profile_paths.append(f"{profile.library_path}{canonical_path}")
 
-                all_paths.append(profile_path)
+                if getattr(profile, "exclusive", False):
+                    exclusive = True
+
+        # A profile is an ADDITIONAL view by default: the item stays in the base
+        # /movies or /shows tree as well, which means a media server indexes the
+        # same file twice (two metadata rows, two watch states). An `exclusive`
+        # profile instead MOVES the item, so it lives in exactly one library.
+        all_paths = [] if exclusive else [canonical_path]
+        all_paths.extend(profile_paths)
+
+        # Never return nothing: an exclusive profile that somehow contributed no
+        # path would otherwise unregister the item from the filesystem entirely.
+        if not all_paths:
+            all_paths = [canonical_path]
 
         return all_paths
 

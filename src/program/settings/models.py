@@ -201,6 +201,14 @@ class LibraryProfile(BaseModel):
         description="VFS path prefix for this profile (e.g., '/kids', '/anime')"
     )
     enabled: bool = Field(default=True, description="Enable this profile")
+    exclusive: bool = Field(
+        default=False,
+        description="Move matching items into this profile instead of copying them. "
+        "By default a profile is an ADDITIONAL view: an item appears both in the "
+        "base /movies or /shows tree and under library_path, so a media server "
+        "indexes it twice. With exclusive=true the base path is omitted for items "
+        "this profile matches, so each item lives in exactly one library.",
+    )
     filter_rules: LibraryProfileFilterRules = Field(
         default_factory=lambda: LibraryProfileFilterRules(),
         description="Metadata filter rules for matching items",
