@@ -570,39 +570,85 @@ class ProgramScheduler:
             # fixed on the /scrape/auto and /items/reindex routes, and the reason
             # a continuing show only ever got its new season when a user manually
             # requested it (patch 0033).
-            added = 0
+
+            # Membership must be sampled for the WHOLE subtree BEFORE anything
+            # is added. Season.episodes is cascade="all, delete-orphan", so
+            # session.add(season) cascades save-update to its episodes and any
+            # episode inspected afterwards already reads as in-session. Patch
+            # 0033 interleaved the check with the add, so `added` only ever
+            # counted new SEASONS: Futurama S11 persisted 1 season + 10
+            # episodes on 2026-08-24 and reported "1". That is not cosmetic —
+            # a reindex that adds episodes to a season which already exists
+            # (the episode-less season shell patch 0032 heals, or an episode
+            # row deleted per patch 0036) counted 0 and therefore never
+            # enqueued anything at all (patch 0040).
+            new_children = list[MediaItem]()
 
             if isinstance(merged, Show):
                 for season in merged.seasons:
                     if season not in session:
-                        added += 1
-
-                    session.add(season)
+                        new_children.append(season)
 
                     for episode in season.episodes:
                         if episode not in session:
-                            added += 1
+                            new_children.append(episode)
 
+                for season in merged.seasons:
+                    session.add(season)
+
+                    for episode in season.episodes:
                         session.add(episode)
+
+            added = len(new_children)
+
+            # Episodes that had already aired by the time they were discovered
+            # are the ones nothing else will ever kick: the monitor only
+            # schedules an episode_release task for a FUTURE air date.
+            aired_episodes = [
+                child
+                for child in new_children
+                if isinstance(child, Episode)
+                and child.last_state != States.Completed
+                and child.is_released
+            ]
 
             session.commit()
 
             logger.info(f"Reindexed {item.log_string} from scheduler")
 
             # A season discovered after its episodes already aired has no
-            # upcoming-release task to enqueue it (_schedule_upcoming_episodes
-            # only schedules future air dates), so those episodes would sit
-            # Indexed indefinitely. Nudge the show into the pipeline, but only
-            # when the reindex actually persisted something new.
+            # upcoming-release task to enqueue it, so those episodes would sit
+            # Indexed indefinitely. Nudge the pipeline, but only when the
+            # reindex actually persisted something new.
             if added:
                 logger.info(
                     f"Reindex persisted {added} new season/episode rows for "
                     f"{merged.log_string}; enqueueing"
                 )
 
-                self.program.em.add_event(
-                    Event(emitted_by="Scheduler", item_id=merged.id)
-                )
+                # Enqueue the aired episodes THEMSELVES, not the show. A show
+                # event cannot reach them: state_transition deliberately keeps
+                # a Season as one unit so a season pack can be matched, and
+                # only decomposes to per-episode scraping after
+                # SEASON_PACK_FALLBACK_THRESHOLD=3 failed season scrapes
+                # (patch 0018). A season discovered mid-air has no pack, so the
+                # single season-level attempt a show event buys fails and the
+                # already-aired episodes stay Indexed until a human requests
+                # the season — exactly what happened to Futurama S11E01-E04
+                # (enqueued 06:00:22, one failed "Futurama S11" scrape at
+                # 06:00:33, still Indexed two hours later). Asking per episode
+                # loses nothing: scrapers/shared.py matches a pack-shaped
+                # torrent (no episodes, right season number) against an
+                # Episode too.
+                for episode in aired_episodes:
+                    self.program.em.add_event(
+                        Event(emitted_by="Scheduler", item_id=episode.id)
+                    )
+
+                if not aired_episodes:
+                    self.program.em.add_event(
+                        Event(emitted_by="Scheduler", item_id=merged.id)
+                    )
 
     def _enqueue_item_if_needed(self, session: Session, item: MediaItem) -> None:
         """Refresh state and enqueue item to the event manager if not completed."""
