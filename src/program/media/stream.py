@@ -57,6 +57,9 @@ class Stream(Base):
     lev_ratio: Mapped[float]
     resolution: Mapped[str | None]
     is_cached: bool = False
+    blacklisted: Mapped[bool] = mapped_column(
+        default=False, server_default=sqlalchemy.text("false"), nullable=False
+    )
     parents: Mapped[list["MediaItem"]] = relationship(
         secondary="StreamRelation", back_populates="streams", lazy="selectin"
     )

@@ -170,11 +170,42 @@ class RealDebridDownloader(DownloaderBase):
         self.settings = settings_manager.settings.downloaders.real_debrid
         self.api: RealDebridAPI | None = None
         # In-memory set of infohashes RD has flagged as 451 / infringing.
-        # Subsequent items pointing at the same hash skip the RD call to
-        # avoid burning rate-limit budget on hashes RD will never serve.
-        # Lost on restart (acceptable; gets repopulated quickly).
+        # Populated from the Stream.blacklisted column on init (so it
+        # survives restarts) and written through on every 451 we see.
         self._infringing_hashes: set[str] = set()
         self.initialized = self.validate()
+        if self.initialized:
+            self._load_infringing_hashes()
+
+    def _load_infringing_hashes(self) -> None:
+        """Populate the in-memory 451 set from the Stream.blacklisted column."""
+        try:
+            from program.db.db import db_session
+            from program.media.stream import Stream
+            from sqlalchemy import select
+            with db_session() as s:
+                rows = s.execute(
+                    select(Stream.infohash).where(Stream.blacklisted.is_(True)).distinct()
+                ).scalars().all()
+                self._infringing_hashes.update(rows)
+            if self._infringing_hashes:
+                logger.info(
+                    f"Real-Debrid: pre-loaded {len(self._infringing_hashes)} known-infringing infohashes from DB"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to load infringing hashes from DB: {e}")
+
+    def _mark_infohash_blacklisted_in_db(self, infohash: str) -> None:
+        """Mark all Stream rows with this infohash as blacklisted."""
+        try:
+            from program.db.db import db_session
+            from program.media.stream import Stream
+            from sqlalchemy import update
+            with db_session() as s:
+                s.execute(update(Stream).where(Stream.infohash == infohash).values(blacklisted=True))
+                s.commit()
+        except Exception as e:
+            logger.debug(f"Failed to persist blacklist for {infohash}: {e}")
 
     def validate(self) -> bool:
         """
@@ -300,9 +331,11 @@ class RealDebridDownloader(DownloaderBase):
 
             # 451 = Infringing torrent - raise special exception for immediate blacklisting
             # This is a permanent failure, the torrent will never work on this debrid service.
-            # Also cache the hash so the next item with the same hash skips RD entirely.
+            # Cache the hash (in-memory + DB) so subsequent items with the same
+            # hash skip RD entirely, even across container restarts.
             if "[451]" in error_msg:
                 self._infringing_hashes.add(infohash)
+                self._mark_infohash_blacklisted_in_db(infohash)
                 raise InfringingTorrentException(infohash)
 
             return None
