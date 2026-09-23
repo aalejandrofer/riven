@@ -4,7 +4,7 @@ import json
 import threading
 import traceback
 from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from queue import Empty
 from threading import Lock
 from typing import TYPE_CHECKING
@@ -51,6 +51,23 @@ class EventType(Enum):
     Scraped = 4
 
 
+# Patch 0021: cap concurrent futures per service to avoid flooding the
+# executor SimpleQueue (upstream issue #1372 — workers silently die when
+# 400+ Scraped items dump in at once).
+MAX_PENDING_PER_SERVICE = 5
+# Re-queue delay when cap is hit. Avoids spin loop.
+REQUEUE_BACKOFF_SECONDS = 30
+# Multi-worker pools for I/O-bound services. Other services keep
+# the default max_workers=1 so we don't break ordering assumptions.
+_MULTI_WORKER_SERVICES: dict[str, int] = {
+    "Downloader": 2,
+    "Symlinker": 4,
+    "PostProcessing": 2,
+    "FilesystemService": 3,
+    "Scraping": 3,
+}
+
+
 class EventManager:
     """
     Manages the execution of services and the handling of events.
@@ -61,6 +78,8 @@ class EventManager:
         self._futures = list[FutureWithEvent]()
         self._queued_events = list[Event]()
         self._running_events = list[Event]()
+        # Patch 0021: track pending futures per service for cap check.
+        self._pending_per_service: dict[str, int] = {}
         self.mutex = Lock()
 
     def _find_or_create_executor(self, service_cls: Service) -> ThreadPoolExecutor:
@@ -82,9 +101,11 @@ class EventManager:
 
                 return service_executor.executor
 
+        # Patch 0021: multi-worker pools for I/O-bound services.
+        workers = _MULTI_WORKER_SERVICES.get(service_name, 1)
         _executor = ThreadPoolExecutor(
             thread_name_prefix=service_name,
-            max_workers=1,
+            max_workers=workers,
         )
 
         self._executors.append(
@@ -158,6 +179,13 @@ class EventManager:
             # to avoid a double-removal ValueError.
             if future_with_event in self._futures:
                 self._futures.remove(future_with_event)
+
+            # Patch 0021: decrement pending counter for this service.
+            service_name = service.__class__.__name__
+            with self.mutex:
+                current = self._pending_per_service.get(service_name, 0)
+                if current > 0:
+                    self._pending_per_service[service_name] = current - 1
 
             if future_with_event.event:
                 self.remove_event_from_running(future_with_event.event)
@@ -311,6 +339,22 @@ class EventManager:
 
             return
 
+        # Patch 0021: cap pending futures per service. Re-queue with delay
+        # instead of dumping onto a saturated executor (issue #1372).
+        service_name = service.__class__.__name__
+        with self.mutex:
+            pending = self._pending_per_service.get(service_name, 0)
+        if pending >= MAX_PENDING_PER_SERVICE and event is not None:
+            event.run_at = datetime.now() + timedelta(seconds=REQUEUE_BACKOFF_SECONDS)
+            with self.mutex:
+                if event not in self._queued_events:
+                    self._queued_events.append(event)
+            logger.debug(
+                f"submit_job: {service_name} at cap ({pending}); re-queued "
+                f"{event.log_message} for +{REQUEUE_BACKOFF_SECONDS}s"
+            )
+            return
+
         log_message = f"Submitting service {service.__class__.__name__} to be executed"
 
         # Content services dont provide an event.
@@ -343,6 +387,11 @@ class EventManager:
         )
 
         self._futures.append(future_with_event)
+        # Patch 0021: bump pending counter.
+        with self.mutex:
+            self._pending_per_service[service_name] = (
+                self._pending_per_service.get(service_name, 0) + 1
+            )
 
         sse_manager.publish_event(
             "event_update",
