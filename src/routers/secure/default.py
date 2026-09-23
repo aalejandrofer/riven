@@ -649,3 +649,130 @@ async def generate_debug_bundle() -> DebugResponse:
         system_info=system_info,
         errors=errors,
     )
+
+
+# === Patch 0020: queue visibility =========================================
+# Exposes EventManager._queued_events / _running_events so the frontend
+# can render a queue page. Resolves internal item_id to the
+# external (tvdb/tmdb) id + media_type that the detail page expects.
+
+class QueueEvent(BaseModel):
+    emitted_by: str
+    item_id: int | None
+    item_type: str | None
+    external_id: str | None
+    media_type: str | None  # "tv" or "movie" for detail page routing
+    display_title: str | None  # "Show Name S01E02" / "Movie Name" / "Show Name S01"
+    item_state: str | None
+    run_at: str
+    log_message: str
+
+
+class QueueExecutor(BaseModel):
+    service_name: str
+    worker_count: int
+
+
+class QueueResponse(BaseModel):
+    queued_count: int
+    running_count: int
+    queued: list[QueueEvent]
+    running: list[QueueEvent]
+    executors: list[QueueExecutor]
+
+
+def _serialize_event(ev: Any) -> QueueEvent:
+    emitted = ev.emitted_by
+    emitted_name = (
+        emitted if isinstance(emitted, str) else emitted.__class__.__name__
+    )
+    return QueueEvent(
+        emitted_by=emitted_name,
+        item_id=ev.item_id,
+        item_type=None,
+        external_id=None,
+        media_type=None,
+        display_title=None,
+        item_state=ev.item_state.value if ev.item_state else None,
+        run_at=ev.run_at.isoformat(),
+        log_message=ev.log_message,
+    )
+
+
+def _resolve_items(item_ids: list[int]) -> dict[int, tuple[str | None, str | None, str | None, str | None]]:
+    """Map internal item_id -> (type, external_id, media_type, display_title)."""
+    if not item_ids:
+        return {}
+    out: dict[int, tuple[str | None, str | None, str | None, str | None]] = {}
+    with db_session() as session:
+        items = session.execute(
+            select(MediaItem).where(MediaItem.id.in_(item_ids))
+        ).scalars().all()
+        for it in items:
+            t = it.type if isinstance(it.type, str) else getattr(it.type, "value", None)
+            ext = None
+            mtype = None
+            display = it.title or ""
+            if isinstance(it, Movie):
+                ext = it.tmdb_id
+                mtype = "movie"
+            elif isinstance(it, Show):
+                ext = it.tvdb_id or it.tmdb_id or it.imdb_id
+                mtype = "tv"
+            elif isinstance(it, Season):
+                parent = getattr(it, "parent", None)
+                ext = getattr(parent, "tvdb_id", None) or getattr(parent, "tmdb_id", None) or getattr(parent, "imdb_id", None)
+                mtype = "tv"
+                show_title = getattr(parent, "title", "") or ""
+                num = getattr(it, "number", None)
+                display = f"{show_title} S{num:02d}" if num is not None else show_title
+            elif isinstance(it, Episode):
+                season = getattr(it, "parent", None)
+                show = getattr(season, "parent", None) if season else None
+                ext = getattr(show, "tvdb_id", None) or getattr(show, "tmdb_id", None) or getattr(show, "imdb_id", None)
+                mtype = "tv"
+                show_title = getattr(show, "title", "") or ""
+                s_num = getattr(season, "number", None) if season else None
+                e_num = getattr(it, "number", None)
+                if s_num is not None and e_num is not None:
+                    display = f"{show_title} S{s_num:02d}E{e_num:02d}"
+                else:
+                    display = show_title or it.title or ""
+            out[it.id] = (t, str(ext) if ext is not None else None, mtype, display or None)
+    return out
+
+
+@router.get(
+    "/events/queue",
+    summary="EventManager queue snapshot",
+    operation_id="events_queue",
+    response_model=QueueResponse,
+)
+async def events_queue() -> QueueResponse:
+    em = di[Program].em
+    with em.mutex:
+        queued = [_serialize_event(e) for e in list(em._queued_events)]
+        running = [_serialize_event(e) for e in list(em._running_events)]
+        executors = [
+            QueueExecutor(
+                service_name=se.service_name,
+                worker_count=getattr(se.executor, "_max_workers", 0),
+            )
+            for se in list(em._executors)
+        ]
+    ids = sorted({ev.item_id for ev in queued + running if ev.item_id is not None})
+    enrichment = _resolve_items(ids)
+    for ev in queued + running:
+        if ev.item_id is not None and ev.item_id in enrichment:
+            t, ext, mtype, display = enrichment[ev.item_id]
+            ev.item_type = t
+            ev.external_id = ext
+            ev.media_type = mtype
+            ev.display_title = display
+    return QueueResponse(
+        queued_count=len(queued),
+        running_count=len(running),
+        queued=queued,
+        running=running,
+        executors=executors,
+    )
