@@ -34,10 +34,10 @@ class Exclusions:
         return False
 
     def _is_excluded_show(self, item: Show) -> bool:
-        if item.tvdb_id is None:
-            return False
-
-        return str(item.tvdb_id) in self.excluded_shows
+        # Patch 0016: shows may lack tvdb_id (e.g. anime, unmatched).
+        # Fall back to tmdb_id / imdb_id so exclusion still works.
+        ids = [item.tvdb_id, item.tmdb_id, item.imdb_id]
+        return any(i is not None and str(i) in self.excluded_shows for i in ids)
 
     def _is_excluded_movie(self, item: Movie) -> bool:
         if item.tmdb_id is None and item.imdb_id is None:
