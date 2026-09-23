@@ -10,6 +10,7 @@ from program.services.downloaders.models import (
     DebridFile,
     InvalidDebridFileException,
     TorrentContainer,
+    TorrentFile,
     TorrentInfo,
     UserInfo,
     UnrestrictedLink,
@@ -469,7 +470,7 @@ class AllDebridDownloader(DownloaderBase):
         - 'e' (entries): array of nested files/folders (only for folders)
         """
 
-        for file_entry in file_list:
+        for index, file_entry in enumerate(file_list, start=1):
             name = file_entry.n
             current_path = f"{path_prefix}/{name}" if path_prefix else name
 
@@ -485,7 +486,11 @@ class AllDebridDownloader(DownloaderBase):
                     filename=name,
                     filesize_bytes=size,
                     filetype=item_type,
-                    file_id=None,
+                    # Positional id over the flat _get_magnet_files list (same
+                    # enumeration get_torrent_info uses) so the manual session can
+                    # select/match AD files; previously file_id was None and the
+                    # session's "skip if file_id is None" dropped every AD file.
+                    file_id=index,
                 )
 
                 df.download_url = link
@@ -703,6 +708,25 @@ class AllDebridDownloader(DownloaderBase):
             datetime.fromtimestamp(completion_date) if completion_date else None
         )
 
+        # Expose file links on the TorrentInfo (RD-shaped) so the manual-session
+        # path (which reads info.files) works for AD too. IDs are 1-based
+        # positional over the same flat _get_magnet_files list that
+        # _extract_files_recursive enumerates, so container file_ids and
+        # info.files keys line up for select/complete.
+        files_dict = dict[int, TorrentFile]()
+        magnet_files = self._get_magnet_files(torrent_id)
+        if magnet_files:
+            for idx, mf in enumerate(magnet_files, start=1):
+                if not mf.l:
+                    continue
+                files_dict[idx] = TorrentFile(
+                    id=idx,
+                    path=mf.n,
+                    bytes=mf.s,
+                    selected=1,
+                    download_url=mf.l,
+                )
+
         return TorrentInfo(
             id=torrent_id,
             name=magnet_data.filename,
@@ -712,7 +736,7 @@ class AllDebridDownloader(DownloaderBase):
             created_at=created_at,
             completed_at=completed_at,
             progress=100.0 if magnet_data.status_code == 4 else 0.0,
-            files={},  # Files are retrieved separately via magnet/files
+            files=files_dict,
             links=[],
         )
 
