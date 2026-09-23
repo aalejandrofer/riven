@@ -1,4 +1,4 @@
-﻿from typing import Literal, cast
+from typing import Literal, cast
 from pydantic import BaseModel, field_validator
 import regex
 from loguru import logger
